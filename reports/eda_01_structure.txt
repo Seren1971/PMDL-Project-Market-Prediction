@@ -1,0 +1,21 @@
+train: (9048, 98) | test: (10, 99)
+train date_id: 0 -> 9047 | монотонно+шаг1: True
+test  date_id: 8980 -> 8989
+дубликаты date_id в train: 0
+
+=== группы фич ===
+D    n=  9  D1..D9  пропущенные номера: нет
+E    n= 20  E1..E20  пропущенные номера: нет
+I    n=  9  I1..I9  пропущенные номера: нет
+M    n= 18  M1..M18  пропущенные номера: нет
+P    n= 13  P1..P13  пропущенные номера: нет
+S    n= 12  S1..S12  пропущенные номера: нет
+V    n= 13  V1..V13  пропущенные номера: нет
+итого фич: 94
+нефичевые колонки train: ['date_id', 'forward_returns', 'risk_free_rate', 'market_forward_excess_returns']
+нефичевые колонки test : ['date_id', 'is_scored', 'lagged_forward_returns', 'lagged_risk_free_rate', 'lagged_market_forward_excess_returns']
+есть ли MOM* : НЕТ
+
+колонки train не в test: ['forward_returns', 'risk_free_rate', 'market_forward_excess_returns']
+колонки test не в train: ['is_scored', 'lagged_forward_returns', 'lagged_risk_free_rate', 'lagged_market_forward_excess_returns']
+порядок фич совпадает: True

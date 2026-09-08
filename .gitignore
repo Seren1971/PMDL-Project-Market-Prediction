@@ -1,0 +1,17 @@
+# competition data — не коммитим
+data/raw/
+data/interim/
+data/processed/
+*.csv
+*.parquet
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.DS_Store
+
+# архивы
+*.zip
