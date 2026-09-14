@@ -1,7 +1,8 @@
-"""Global configuration: seeds, paths and column conventions.
+"""
+Central configuration: seeds, paths, column conventions.
 
-Every notebook imports SEED from here so that all experiments are reproducible
-and comparable on identical folds.
+PMLDL 2026 Stage 2 project - Hull Tactical Market Prediction.
+Every notebook imports from here; nothing is hard-coded downstream.
 """
 
 from __future__ import annotations
@@ -12,61 +13,63 @@ from pathlib import Path
 
 import numpy as np
 
-# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 # Reproducibility
-# --------------------------------------------------------------------------------------
-SEED: int = 42
+# --------------------------------------------------------------------------
+SEED = 42
+TRADING_DAYS = 252
 
 
 def set_seed(seed: int = SEED) -> int:
-    """Set every random seed we can reach and return the seed (for logging)."""
+    """Seed every RNG this project can touch. Call once per notebook."""
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
-    try:  # optional dependency
-        import torch  # type: ignore
+    try:
+        import torch  # noqa: WPS433 - optional dependency
 
         torch.manual_seed(seed)
-    except Exception:
+        torch.cuda.manual_seed_all(seed)
+    except ImportError:
         pass
     return seed
 
 
-# --------------------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 # Paths
-# --------------------------------------------------------------------------------------
-PROJECT_ROOT: Path = Path(__file__).resolve().parents[1]
-DATA_DIR: Path = Path(os.environ.get("HULL_DATA_DIR", PROJECT_ROOT / "data"))
-RESULTS_DIR: Path = PROJECT_ROOT / "results"
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+# --------------------------------------------------------------------------
+# src/ lives directly under the project root.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = Path(os.environ.get("HULL_DATA_DIR", PROJECT_ROOT / "data" / "raw"))
+RESULTS_DIR = Path(os.environ.get("HULL_RESULTS_DIR", PROJECT_ROOT / "results"))
+ARTIFACT_DIR = RESULTS_DIR / "artifacts"
 
-# --------------------------------------------------------------------------------------
-# Column conventions of the competition dataset
-# --------------------------------------------------------------------------------------
-TARGET: str = "market_forward_excess_returns"
-RETURN_COL: str = "forward_returns"
-RISK_FREE_COL: str = "risk_free_rate"
-DATE_COL: str = "date_id"
+# Kaggle kernels mount the competition here; used as a fallback by the loader.
+KAGGLE_DATA_DIR = Path("/kaggle/input/hull-tactical-market-prediction")
 
-# Columns that must never be used as model inputs (they contain the future).
-LEAKY_COLS: tuple[str, ...] = (
-    "forward_returns",
-    "risk_free_rate",
-    "excess_return",
-    "market_forward_excess_returns",
-    "lagged_forward_returns",
-    "lagged_risk_free_rate",
-    "lagged_market_forward_excess_returns",
-    "is_scored",
-)
+# --------------------------------------------------------------------------
+# Column conventions (see data/README.md for the official field descriptions)
+# --------------------------------------------------------------------------
+DATE_COL = "date_id"
 
-# Anonymised feature family prefixes used by the competition.
-FEATURE_PREFIXES: tuple[str, ...] = ("D", "E", "I", "M", "P", "S", "V")
+#: Default supervised target. De-meaned (5y rolling) and MAD-winsorised by the
+#: organisers, so it is materially easier to learn than raw ``forward_returns``.
+TARGET = "market_forward_excess_returns"
 
-# Trading days per year, used to annualise Sharpe / volatility.
-ANNUALISATION: int = 252
+#: Columns present in train.csv only. They describe the *future* relative to a
+#: row and must never be used as model inputs.
+LOOKAHEAD_COLS = ("forward_returns", "risk_free_rate", "market_forward_excess_returns")
 
-# Competition constraints.
-MIN_POSITION: float = 0.0
-MAX_POSITION: float = 2.0
-VOL_CEILING_RATIO: float = 1.2  # strategy vol may not exceed 120% of market vol
+#: Anonymised feature family prefixes, per the competition data description.
+FEATURE_PREFIXES = ("M", "E", "I", "P", "V", "S", "D")
+
+# Only the public phase is in scope for this project: the public leaderboard
+# set is a copy of the last 180 date_ids of train.csv.
+PUBLIC_TEST_SIZE = 180
+
+# --------------------------------------------------------------------------
+# Shared cross-validation settings - IDENTICAL IN EVERY NOTEBOOK
+# --------------------------------------------------------------------------
+CV_N_SPLITS = 4
+CV_EMBARGO = 20  # trading days dropped after each validation block
+CV_PURGE = 1  # target horizon of 1 day -> purge 1 row before each block

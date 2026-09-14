@@ -1,130 +1,151 @@
-"""Leak-safe validation for a forward-looking financial target.
+"""
+Purged / embargoed time-series cross-validation.
 
-Why not ``KFold``?
-------------------
-The target at row *t* (``market_forward_excess_returns``) is realised at *t+1* and the
-engineered features at *t* are built from a rolling window that ends at *t*.  A random
-split would therefore let the model see the future, and a plain ``TimeSeriesSplit`` would
-still let the last training rows overlap the first validation rows through both the target
-horizon and the rolling windows.
+Every notebook in this project must call :func:`get_folds` with the default
+settings so that baseline, proposed and improved models are compared on
+mathematically identical folds.
 
-``PurgedTimeSeriesSplit`` fixes both problems:
+Concept
+-------
+Standard ``TimeSeriesSplit`` leaks in two ways on financial data:
 
-* **purge**  - drop the last ``purge`` training rows before every validation block so that
-  no training label depends on a validation observation (label-horizon overlap);
-* **embargo** - additionally drop ``embargo`` rows so that rolling-window features of the
-  first validation rows do not overlap the training window (serial-correlation leakage);
-* **expanding or sliding** training windows (``max_train_size``) for regime adaptivity.
+1. The last training row's target overlaps the first validation row (the target
+   is a *forward* return). Fixed by **purging** ``purge`` rows before each
+   validation block.
+2. Serial correlation makes rows immediately after a validation block
+   informative about it. Fixed by an **embargo** of ``embargo`` rows after each
+   block, relevant once training windows are allowed to extend past a block.
 
-Every notebook in this project instantiates the folds through :func:`default_cv`, so all
-models are compared on **mathematically identical folds**.
+The folds are a deterministic function of the number of rows only, so two
+notebooks operating on the same dataframe get byte-identical splits.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterator, Sequence
 
 import numpy as np
 import pandas as pd
 
-__all__ = ["PurgedTimeSeriesSplit", "default_cv", "describe_folds"]
+from .config import CV_EMBARGO, CV_N_SPLITS, CV_PURGE, DATE_COL
 
 
-@dataclass
+@dataclass(frozen=True)
+class Fold:
+    """One cross-validation fold, stored as positional indices."""
+
+    index: int
+    train_idx: np.ndarray
+    val_idx: np.ndarray
+
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return (
+            f"Fold({self.index}: train={len(self.train_idx)} rows, "
+            f"val={len(self.val_idx)} rows)"
+        )
+
+
 class PurgedTimeSeriesSplit:
-    """Chronological CV with purging and an embargo period.
+    """Expanding-window splitter with purge and embargo gaps.
 
-    Parameters
-    ----------
-    n_splits
-        Number of validation blocks.
-    test_size
-        Rows per validation block.  ``None`` -> ``n_samples // (n_splits + 1)``.
-    purge
-        Rows removed at the end of the training window because their label overlaps the
-        validation block (>= the label horizon, which is 1 day here).
-    embargo
-        Extra rows removed after the purge, covering feature-side leakage from rolling
-        windows.
-    max_train_size
-        If set, the training window slides instead of expanding (keeps at most this many
-        of the most recent rows).
-    min_train_size
-        Folds whose training window would be smaller than this are skipped.
+    Sklearn-compatible: exposes ``split`` and ``get_n_splits``.
     """
 
-    n_splits: int = 5
-    test_size: int | None = None
-    purge: int = 1
-    embargo: int = 10
-    max_train_size: int | None = None
-    min_train_size: int = 250
+    def __init__(
+        self,
+        n_splits: int = CV_N_SPLITS,
+        purge: int = CV_PURGE,
+        embargo: int = CV_EMBARGO,
+        max_train_size: int | None = None,
+    ) -> None:
+        if n_splits < 2:
+            raise ValueError("n_splits must be >= 2")
+        self.n_splits = n_splits
+        self.purge = purge
+        self.embargo = embargo
+        self.max_train_size = max_train_size
 
-    # ---------------------------------------------------------------- sklearn API
-    def get_n_splits(self, X=None, y=None, groups=None) -> int:
+    def get_n_splits(self, X=None, y=None, groups=None) -> int:  # noqa: N803
         return self.n_splits
 
-    def split(self, X, y=None, groups=None) -> Iterator[tuple[np.ndarray, np.ndarray]]:
-        n = _n_samples(X)
-        test_size = self.test_size or max(1, n // (self.n_splits + 1))
-        gap = int(self.purge) + int(self.embargo)
-
-        # Validation blocks are laid out contiguously at the end of the series.
-        starts = [n - (self.n_splits - i) * test_size for i in range(self.n_splits)]
-        for start in starts:
-            stop = start + test_size
-            train_end = start - gap
-            if train_end <= 0:
-                continue
-            train_start = 0
-            if self.max_train_size is not None:
-                train_start = max(0, train_end - self.max_train_size)
-            if train_end - train_start < self.min_train_size:
-                continue
-            yield (
-                np.arange(train_start, train_end, dtype=int),
-                np.arange(start, min(stop, n), dtype=int),
+    def split(self, X, y=None, groups=None):  # noqa: N803
+        n_samples = len(X)
+        # Equal-sized validation blocks covering the tail of the series.
+        fold_size = n_samples // (self.n_splits + 1)
+        if fold_size <= self.purge + self.embargo:
+            raise ValueError(
+                f"{n_samples} rows is too few for {self.n_splits} splits with "
+                f"purge={self.purge}, embargo={self.embargo}."
             )
 
+        indices = np.arange(n_samples)
+        for i in range(self.n_splits):
+            val_start = fold_size * (i + 1)
+            val_end = n_samples if i == self.n_splits - 1 else fold_size * (i + 2)
 
-def _n_samples(X) -> int:
-    if isinstance(X, (pd.DataFrame, pd.Series)):
-        return len(X)
-    if isinstance(X, (list, tuple)):
-        return len(X)
-    return int(np.asarray(X).shape[0])
+            train_end = val_start - self.purge
+            train_idx = indices[:train_end]
+            if self.max_train_size is not None:
+                train_idx = train_idx[-self.max_train_size :]
+
+            val_idx = indices[val_start:val_end]
+            # Embargo trims the head of the validation block so it never sits
+            # flush against training rows it is correlated with.
+            if self.embargo:
+                val_idx = val_idx[self.embargo :]
+
+            if len(train_idx) == 0 or len(val_idx) == 0:
+                continue
+            yield train_idx, val_idx
 
 
-def default_cv(
-    n_splits: int = 5,
-    embargo: int = 10,
-    purge: int = 1,
+def get_folds(
+    df: pd.DataFrame,
+    n_splits: int = CV_N_SPLITS,
+    purge: int = CV_PURGE,
+    embargo: int = CV_EMBARGO,
     max_train_size: int | None = None,
-) -> PurgedTimeSeriesSplit:
-    """The single CV configuration shared by *all* notebooks of this project."""
-    return PurgedTimeSeriesSplit(
-        n_splits=n_splits,
-        purge=purge,
-        embargo=embargo,
-        max_train_size=max_train_size,
+) -> list[Fold]:
+    """Return the canonical fold list. **Use the defaults in every notebook.**"""
+    splitter = PurgedTimeSeriesSplit(
+        n_splits=n_splits, purge=purge, embargo=embargo, max_train_size=max_train_size
     )
+    return [
+        Fold(index=i, train_idx=tr, val_idx=va)
+        for i, (tr, va) in enumerate(splitter.split(df))
+    ]
 
 
-def describe_folds(cv: PurgedTimeSeriesSplit, X, index: Sequence | None = None) -> pd.DataFrame:
-    """Human-readable fold layout (used in the notebooks to prove folds are identical)."""
+def describe_folds(df: pd.DataFrame, folds: list[Fold]) -> pd.DataFrame:
+    """Human-readable fold summary; print this in every notebook as evidence
+    that the splits match across models."""
     rows = []
-    for k, (tr, va) in enumerate(cv.split(X), start=1):
-        rows.append(
-            {
-                "fold": k,
-                "train_start": int(tr[0]),
-                "train_end": int(tr[-1]),
-                "n_train": len(tr),
-                "gap": int(va[0] - tr[-1] - 1),
-                "valid_start": int(va[0]),
-                "valid_end": int(va[-1]),
-                "n_valid": len(va),
-            }
-        )
+    has_date = DATE_COL in df.columns
+    for fold in folds:
+        row = {
+            "fold": fold.index,
+            "n_train": len(fold.train_idx),
+            "n_val": len(fold.val_idx),
+        }
+        if has_date:
+            dates = df[DATE_COL].to_numpy()
+            row["train_end_date_id"] = dates[fold.train_idx[-1]]
+            row["val_start_date_id"] = dates[fold.val_idx[0]]
+            row["val_end_date_id"] = dates[fold.val_idx[-1]]
+            row["gap_days"] = row["val_start_date_id"] - row["train_end_date_id"]
+        rows.append(row)
     return pd.DataFrame(rows)
+
+
+def assert_no_leakage(folds: list[Fold], purge: int = CV_PURGE) -> None:
+    """Fail loudly if any fold's training indices reach into its validation
+    block or violate the purge gap."""
+    for fold in folds:
+        overlap = np.intersect1d(fold.train_idx, fold.val_idx)
+        if overlap.size:
+            raise AssertionError(f"Fold {fold.index}: {overlap.size} overlapping rows.")
+        gap = fold.val_idx[0] - fold.train_idx[-1]
+        if gap <= purge:
+            raise AssertionError(
+                f"Fold {fold.index}: gap of {gap} rows violates purge={purge}."
+            )

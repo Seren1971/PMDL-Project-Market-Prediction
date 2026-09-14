@@ -1,61 +1,80 @@
-# `data/` - dataset placeholder
+# Data
 
-This folder is intentionally empty in version control. The project runs in either of two
-modes, decided automatically by `src.data.load_dataset`.
+The competition data is **not** committed to this repository. Download it once
+into `data/raw/`.
 
-## Mode 1 - real Kaggle data (preferred)
-
-Place the competition training file here:
+## Expected layout
 
 ```
-data/train.csv
+data/
+├── README.md
+└── raw/
+    ├── train.csv          # required
+    ├── test.csv           # optional (mock test set, not used in this project)
+    └── kaggle_evaluation/  # optional, unused: forecasting phase is out of scope
 ```
 
-Download it with the Kaggle CLI:
+## Download
+
+Kaggle CLI (needs `~/.kaggle/kaggle.json`):
 
 ```bash
 pip install kaggle
-# put your kaggle.json API token in ~/.kaggle/kaggle.json  (chmod 600)
-kaggle competitions download -c hull-tactical-market-prediction -p data/
-unzip -o data/hull-tactical-market-prediction.zip -d data/
+kaggle competitions download -c hull-tactical-market-prediction -p data/raw
+unzip -o data/raw/hull-tactical-market-prediction.zip -d data/raw
 ```
 
-Or manually from
-<https://www.kaggle.com/competitions/hull-tactical-market-prediction/data>.
+Or download manually from
+<https://www.kaggle.com/competitions/hull-tactical-market-prediction/data>
+and unzip into `data/raw/`.
 
-Expected columns:
+Running on a Kaggle kernel instead? Nothing to do — the loader falls back to
+`/kaggle/input/hull-tactical-market-prediction`. To point at any other
+location, set `HULL_DATA_DIR`.
 
-| column | meaning |
-|---|---|
-| `date_id` | chronological index of the trading day |
-| `D*`, `E*`, `I*`, `M*`, `P*`, `S*`, `V*` | anonymised feature families (dummy, macro-economic, interest-rate, market-dynamics, price/valuation, sentiment, volatility) |
-| `forward_returns` | total market return realised on the next day |
-| `risk_free_rate` | daily risk-free rate |
-| `market_forward_excess_returns` | **the modelling target**: de-meaned, winsorised forward excess return |
+## Schema
 
-Nothing else has to be configured - every notebook picks the file up automatically. You can
-also point the loader elsewhere with an environment variable:
+`train.csv`, one row per trading day, history stretching back decades with
+extensive missing values in the early rows.
 
-```bash
-export HULL_DATA_DIR=/absolute/path/to/folder/containing/train.csv
-```
+| Column | Meaning |
+| --- | --- |
+| `date_id` | Identifier for a single trading day. Monotonic, not a calendar date. |
+| `M*` | Market dynamics / technical features |
+| `E*` | Macro-economic features |
+| `I*` | Interest rate features |
+| `P*` | Price / valuation features |
+| `V*` | Volatility features |
+| `S*` | Sentiment features |
+| `MOM*` | Momentum features |
+| `D*` | Dummy / binary features |
+| `forward_returns` | Return from buying the S&P 500 and selling it one day later. **Train only.** |
+| `risk_free_rate` | Federal funds rate. **Train only.** |
+| `market_forward_excess_returns` | `forward_returns` minus its rolling 5-year mean, MAD-winsorised at criterion 4. **Train only.** This is the project's supervised target. |
 
-## Mode 2 - synthetic surrogate (automatic fallback)
+All feature names are anonymised; the organisers publish no mapping to real
+instruments.
 
-If `data/train.csv` is absent (for example, a grading environment without Kaggle
-credentials), `src.data.make_synthetic_dataset` generates a **deterministic surrogate**
-seeded with `SEED = 42`. It reproduces the schema and the statistical character of the real
-problem, not its content:
+## Two things that decide how this data may be used
 
-* the same column families and roughly the same feature count (~95);
-* AR(1) log-volatility, so volatility clusters into regimes;
-* a weak, learnable conditional mean mixing short-horizon mean reversion with a slow
-  sentiment component - a realistic signal-to-noise ratio for this kind of problem;
-* pure-noise columns alongside informative ones, so feature selection is meaningful;
-* missing values across the early history, mirroring the sparse pre-2000 rows of the real
-  file.
+**1. The last 180 rows are the public leaderboard set.** The public test set is
+a copy of the final 180 `date_id`s of `train.csv`, which is why public
+leaderboard scores in the competition were not meaningful. `load_dataset()`
+splits them off as a held-out block and they are never used for fitting.
 
-Every notebook prints which mode is active in its first data cell, and the committed outputs
-were produced in surrogate mode. **Numbers obtained in surrogate mode describe the pipeline,
-not the competition**: they show that the comparison between models is valid and
-reproducible, but they are not leaderboard estimates.
+**2. The three columns above describe the future.** `forward_returns` at row
+*t* spans *t → t+1*. Using any of them as a model input is look-ahead leakage.
+The return actually observable at *t* is `forward_returns.shift(1)`, which is
+what `src.data.past_returns()` returns and what every price-derived feature is
+built from.
+
+## Scope
+
+Only the public phase is in scope. The forecasting phase and the
+`kaggle_evaluation` inference server are deliberately excluded — the project
+evaluates offline on purged time-series folds plus the held-out 180-day block.
+
+## Generated outputs
+
+`results/leaderboard.csv` and `results/artifacts/` are written by the notebooks
+and are also not committed.

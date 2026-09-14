@@ -1,19 +1,18 @@
-"""Dataset access layer.
+"""
+Universal data loading for the Hull Tactical Market Prediction dataset.
 
-The project is designed to run in two modes:
+Attribution
+-----------
+The "hold out the last 180 date_ids" evaluation protocol is taken from the
+public leak-safe baseline notebook:
+https://www.kaggle.com/code/morodertobias/hull-leak-safe-baseline
+Rationale (from the competition data description): the public leaderboard test
+set is a *copy* of the last 180 rows of train.csv, so any model fitted on those
+rows reports an optimistic public score. We remove them from training and use
+them as a held-out public split.
 
-1. **Real mode** - the Kaggle competition file ``data/train.csv`` is present
-   (see ``data/README.md`` for the download instructions).  It is loaded as-is.
-2. **Surrogate mode** - the CSV is absent (e.g. no Kaggle credentials in the grading
-   environment).  A *deterministic synthetic surrogate* with the same schema, the same
-   column families (D/E/I/M/P/S/V), the same target definition and realistic financial
-   dynamics (volatility clustering, short-horizon mean reversion, missing history in the
-   early rows) is generated instead, so that **every notebook remains executable and
-   reproducible end-to-end**.
-
-The surrogate is *not* a claim about competition performance; it exists so the pipeline,
-the validation protocol and the model comparison can be reproduced by a grader without
-the private dataset.  All numbers reported in surrogate mode are labelled as such.
+Only the public phase is in scope; the forecasting phase / evaluation API is
+deliberately out of scope for this project.
 """
 
 from __future__ import annotations
@@ -24,186 +23,144 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .config import DATA_DIR, DATE_COL, RETURN_COL, RISK_FREE_COL, SEED, TARGET
-
-# Number of columns per anonymised family (matches the order of magnitude of the
-# real competition file: ~90 anonymised features).
-FAMILY_SIZES: dict[str, int] = {
-    "D": 10,  # dummy / calendar-like binary indicators
-    "E": 20,  # macro-economic
-    "I": 9,   # interest rates
-    "M": 18,  # market dynamics
-    "P": 13,  # price / valuation
-    "S": 12,  # sentiment
-    "V": 13,  # volatility
-}
+from .config import (
+    DATA_DIR,
+    DATE_COL,
+    FEATURE_PREFIXES,
+    KAGGLE_DATA_DIR,
+    LOOKAHEAD_COLS,
+    PUBLIC_TEST_SIZE,
+    TARGET,
+)
 
 
 @dataclass
-class DatasetInfo:
-    """Small provenance record attached to every loaded dataset."""
+class HullData:
+    """Container returned by :func:`load_dataset`.
 
-    source: str  # "kaggle_csv" or "synthetic_surrogate"
-    n_rows: int
-    n_features: int
-    path: str | None = None
-
-    def describe(self) -> str:
-        tag = (
-            "REAL Kaggle competition data"
-            if self.source == "kaggle_csv"
-            else "SYNTHETIC SURROGATE data (Kaggle CSV not found)"
-        )
-        return f"{tag} | rows={self.n_rows:,} | anonymised features={self.n_features}"
-
-
-# --------------------------------------------------------------------------------------
-# Synthetic surrogate
-# --------------------------------------------------------------------------------------
-def make_synthetic_dataset(n_rows: int = 6000, seed: int = SEED) -> pd.DataFrame:
-    """Generate a deterministic surrogate of the competition training file.
-
-    Data generating process
-    -----------------------
-    * log-volatility follows an AR(1) process -> volatility clustering / regimes;
-    * the conditional mean of the next return mixes a **short-horizon mean-reversion**
-      component and a slow **sentiment** component, both scaled by the current
-      volatility -> a weak but learnable signal (annualised IC of a few percent);
-    * anonymised features are noisy, partially redundant observations of the latent
-      states, plus a set of pure-noise columns so that feature selection is meaningful;
-    * the first rows contain missing values for several families, mirroring the sparse
-      pre-2000 history of the real file.
+    Attributes
+    ----------
+    train : rows used for fitting and cross-validation.
+    public : the held-out last ``PUBLIC_TEST_SIZE`` date_ids.
+    full : train + public, chronologically ordered (for feature engineering
+        that needs continuous history).
+    raw_features : base feature columns present in the source file.
     """
-    rng = np.random.default_rng(seed)
-    n = n_rows
 
-    # ---- latent states ----------------------------------------------------------
-    log_vol = np.zeros(n)
-    log_vol[0] = np.log(0.009)
-    for t in range(1, n):
-        log_vol[t] = 0.985 * log_vol[t - 1] + 0.015 * np.log(0.009) + 0.09 * rng.standard_normal()
-    vol = np.clip(np.exp(log_vol), 0.003, 0.06)  # daily volatility
+    train: pd.DataFrame
+    public: pd.DataFrame
+    full: pd.DataFrame
+    raw_features: list[str]
 
-    sentiment = np.zeros(n)
-    for t in range(1, n):
-        sentiment[t] = 0.97 * sentiment[t - 1] + 0.25 * rng.standard_normal()
-
-    rate = np.zeros(n)
-    rate[0] = 0.03
-    for t in range(1, n):
-        rate[t] = np.clip(0.999 * rate[t - 1] + 0.0002 * rng.standard_normal(), 0.0, 0.09)
-
-    # ---- returns ---------------------------------------------------------------
-    ret = np.zeros(n)  # daily *excess* market return realised at t
-    eps = rng.standard_normal(n)
-    for t in range(1, n):
-        window = ret[max(0, t - 3): t]
-        z3 = window.sum() / (vol[t] * np.sqrt(max(len(window), 1)) + 1e-12)
-        mu = vol[t] * (-0.075 * np.clip(z3, -4, 4) + 0.045 * np.tanh(sentiment[t - 1]))
-        ret[t] = mu + vol[t] * eps[t] + 0.00015  # small positive equity drift
-
-    real_vol_20 = pd.Series(ret).rolling(20, min_periods=5).std().bfill().to_numpy()
-    cum = np.cumsum(ret)
-    mom_20 = pd.Series(ret).rolling(20, min_periods=5).mean().bfill().to_numpy()
-    mom_60 = pd.Series(ret).rolling(60, min_periods=5).mean().bfill().to_numpy()
-
-    df = pd.DataFrame({DATE_COL: np.arange(n)})
-
-    def noisy(base: np.ndarray, scale: float, noise: float) -> np.ndarray:
-        return scale * base + noise * rng.standard_normal(n)
-
-    # Volatility family: V1 is the annualised forward-looking vol proxy (as in the
-    # public write-ups), the rest are noisy vol observations.
-    df["V1"] = np.clip(vol * np.sqrt(252) * (1 + 0.05 * rng.standard_normal(n)), 0.03, 1.2)
-    for i in range(2, FAMILY_SIZES["V"] + 1):
-        df[f"V{i}"] = noisy(real_vol_20 * np.sqrt(252), 1.0 if i < 6 else 0.0, 0.05)
-
-    # Interest-rate family.
-    for i in range(1, FAMILY_SIZES["I"] + 1):
-        df[f"I{i}"] = noisy(rate, 1.0 + 0.05 * i, 0.0015)
-
-    # Market-dynamics family: M11 is used by the public solutions as a rate-normalised
-    # market dynamic, so give it real content.
-    for i in range(1, FAMILY_SIZES["M"] + 1):
-        base = mom_20 if i % 3 == 0 else (mom_60 if i % 3 == 1 else np.zeros(n))
-        df[f"M{i}"] = noisy(base, 8.0, 0.03)
-    df["M11"] = noisy(mom_20 * 10 + rate, 1.0, 0.01)
-
-    # Price / valuation family (level-like, slow moving).
-    for i in range(1, FAMILY_SIZES["P"] + 1):
-        df[f"P{i}"] = noisy(cum, 0.6 if i % 2 == 0 else 0.0, 0.15)
-
-    # Sentiment family: S1 carries the latent sentiment.
-    df["S1"] = noisy(np.tanh(sentiment), 1.0, 0.20)
-    for i in range(2, FAMILY_SIZES["S"] + 1):
-        df[f"S{i}"] = noisy(np.tanh(sentiment), 0.7 if i < 6 else 0.0, 0.35)
-
-    # Macro family (mostly slow, mostly uninformative).
-    for i in range(1, FAMILY_SIZES["E"] + 1):
-        df[f"E{i}"] = noisy(rate * 20 + 0.1 * np.tanh(sentiment), 0.5 if i < 8 else 0.0, 0.30)
-
-    # Dummy / calendar family.
-    for i in range(1, FAMILY_SIZES["D"] + 1):
-        df[f"D{i}"] = (rng.random(n) < 0.08).astype(float)
-
-    # ---- targets ---------------------------------------------------------------
-    rf_daily = rate / 252.0
-    forward_excess = np.roll(ret, -1)
-    forward_excess[-1] = np.nan
-    df[TARGET] = forward_excess
-    df[RISK_FREE_COL] = rf_daily
-    df[RETURN_COL] = forward_excess + np.roll(rf_daily, -1)
-    df.loc[df.index[-1], RETURN_COL] = np.nan
-
-    # ---- realistic missingness in the early history ----------------------------
-    for fam, cut in (("E", 900), ("S", 400), ("I", 120), ("V", 60)):
-        cols = [c for c in df.columns if c.startswith(fam) and c[1:].isdigit()]
-        for c in cols[: max(1, len(cols) // 2)]:
-            df.loc[: cut - 1, c] = np.nan
-
-    return df
+    def __repr__(self) -> str:  # pragma: no cover - cosmetic
+        return (
+            f"HullData(train={self.train.shape}, public={self.public.shape}, "
+            f"n_raw_features={len(self.raw_features)})"
+        )
 
 
-# --------------------------------------------------------------------------------------
-# Public loader
-# --------------------------------------------------------------------------------------
+def _resolve_data_dir(data_dir: str | Path | None) -> Path:
+    for candidate in (data_dir, DATA_DIR, KAGGLE_DATA_DIR):
+        if candidate is None:
+            continue
+        path = Path(candidate)
+        if (path / "train.csv").exists():
+            return path
+    raise FileNotFoundError(
+        "train.csv not found. Place the Kaggle files in data/raw/ or set the "
+        "HULL_DATA_DIR environment variable. See data/README.md."
+    )
+
+
+def get_feature_columns(df: pd.DataFrame) -> list[str]:
+    """Return the anonymised feature columns of a raw dataframe.
+
+    Excludes ``date_id``, the three look-ahead columns, any ``lagged_*`` /
+    ``is_scored`` columns, and anything this project derived later.
+    """
+    banned = {DATE_COL, "is_scored", *LOOKAHEAD_COLS}
+    out = []
+    for col in df.columns:
+        if col in banned or col.startswith("lagged_"):
+            continue
+        if col.startswith(FEATURE_PREFIXES) or col.startswith("MOM"):
+            out.append(col)
+    return out
+
+
 def load_dataset(
-    data_dir: str | Path = DATA_DIR,
-    n_rows_synth: int = 6000,
-    seed: int = SEED,
-    verbose: bool = True,
-) -> tuple[pd.DataFrame, DatasetInfo]:
-    """Load ``train.csv`` if available, otherwise build the synthetic surrogate."""
-    data_dir = Path(data_dir)
-    csv_path = data_dir / "train.csv"
+    data_dir: str | Path | None = None,
+    public_test_size: int = PUBLIC_TEST_SIZE,
+    min_valid_ratio: float = 0.5,
+    drop_target_na: bool = True,
+) -> HullData:
+    """Load train.csv and split off the public leaderboard period.
 
-    if csv_path.exists():
-        df = pd.read_csv(csv_path)
-        source, path = "kaggle_csv", str(csv_path)
-    else:
-        df = make_synthetic_dataset(n_rows=n_rows_synth, seed=seed)
-        source, path = "synthetic_surrogate", None
-
-    if DATE_COL not in df.columns:
-        df[DATE_COL] = np.arange(len(df))
+    Parameters
+    ----------
+    data_dir : directory holding train.csv. Falls back to ``data/raw`` then to
+        the Kaggle mount point.
+    public_test_size : number of trailing date_ids reserved as the public split.
+    min_valid_ratio : drop leading rows whose share of non-null features is
+        below this. Coverage stretches back decades and early rows are mostly
+        null; this trims them without touching the recent period.
+    drop_target_na : drop rows where the supervised target is missing.
+    """
+    path = _resolve_data_dir(data_dir)
+    df = pd.read_csv(path / "train.csv")
     df = df.sort_values(DATE_COL).reset_index(drop=True)
 
-    # Drop rows with an undefined target (the last row has no forward return).
-    df = df[df[TARGET].notna()].reset_index(drop=True)
+    raw_features = get_feature_columns(df)
 
-    n_feat = len(feature_columns(df))
-    info = DatasetInfo(source=source, n_rows=len(df), n_features=n_feat, path=path)
-    if verbose:
-        print(info.describe())
-    return df, info
+    if min_valid_ratio > 0 and raw_features:
+        valid_ratio = df[raw_features].notna().mean(axis=1)
+        keep_from = valid_ratio.ge(min_valid_ratio).idxmax()
+        df = df.loc[keep_from:].reset_index(drop=True)
+
+    if drop_target_na and TARGET in df.columns:
+        df = df.dropna(subset=[TARGET]).reset_index(drop=True)
+
+    cutoff = df[DATE_COL].max() - public_test_size
+    train = df.loc[df[DATE_COL] <= cutoff].reset_index(drop=True)
+    public = df.loc[df[DATE_COL] > cutoff].reset_index(drop=True)
+
+    return HullData(train=train, public=public, full=df, raw_features=raw_features)
 
 
-def feature_columns(df: pd.DataFrame) -> list[str]:
-    """Anonymised feature columns (family prefix + digits), leak-free by construction."""
-    from .config import FEATURE_PREFIXES
+def impute(
+    train: pd.DataFrame,
+    *others: pd.DataFrame,
+    columns: list[str] | None = None,
+) -> tuple[pd.DataFrame, ...]:
+    """Forward-fill then fill remaining gaps with the *train* median.
 
-    return [
-        c
-        for c in df.columns
-        if c[:1] in FEATURE_PREFIXES and c[1:].isdigit()
-    ]
+    Statistics come from ``train`` only and are applied to every frame, so no
+    information flows backwards from the held-out period.
+    """
+    columns = columns or [c for c in train.columns if train[c].dtype != object]
+    medians = train[columns].median()
+
+    def _apply(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        cols = [c for c in columns if c in out.columns]
+        out[cols] = out[cols].ffill().fillna(medians[cols]).fillna(0.0)
+        return out
+
+    return tuple(_apply(df) for df in (train, *others))
+
+
+def past_returns(df: pd.DataFrame) -> pd.Series:
+    """Leak-safe realised daily return series.
+
+    ``forward_returns`` at row *t* spans *t -> t+1*, i.e. it is the future. The
+    return already observable at *t* is therefore ``forward_returns.shift(1)``.
+    Every price-derived feature in this project is built from this series.
+    """
+    if "forward_returns" not in df.columns:
+        raise KeyError("'forward_returns' is required to derive return history.")
+    return df["forward_returns"].shift(1).astype(float)
+
+
+def excess_returns(df: pd.DataFrame) -> np.ndarray:
+    """Market excess return per row: ``forward_returns - risk_free_rate``."""
+    return (df["forward_returns"] - df["risk_free_rate"]).to_numpy(dtype=float)

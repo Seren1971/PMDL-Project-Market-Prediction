@@ -1,16 +1,141 @@
 """
-Reusable core modules for the Hull Tactical Market Prediction project (PMLDL 2026, Stage 2).
+Shared library for the Hull Tactical Market Prediction project (PMLDL 2026).
 
-Modules
--------
-config      : global constants, random seed, paths.
-data        : dataset loading (real Kaggle CSV or reproducible synthetic surrogate).
-features    : domain / temporal feature engineering + leak-safe imputation pipeline.
-validation  : purged & embargoed time-series cross-validation.
-metrics     : RMSE, R2, Spearman IC, Sharpe and the competition-style penalised Sharpe.
-allocation  : position-sizing rules (binary, naive linear, volatility targeting).
+Public API - import from here, not from submodules:
+
+    from src import (
+        SEED, TARGET, set_seed,
+        load_dataset, impute, past_returns,
+        build_features,
+        get_folds, describe_folds, assert_no_leakage,
+        evaluate, aggregate_folds,
+        naive_allocation,
+        save_result, compare,
+    )
+
+See INTERFACE.md at the project root for the usage contract.
 """
 
-from . import allocation, config, data, experiment, features, metrics, validation  # noqa: F401
+from .allocation import (
+    binary_allocation,
+    naive_allocation,
+    realised_vol,
+    smooth_weights,
+    vol_target_allocation,
+)
+from .config import (
+    ARTIFACT_DIR,
+    CV_EMBARGO,
+    CV_N_SPLITS,
+    CV_PURGE,
+    DATA_DIR,
+    DATE_COL,
+    LOOKAHEAD_COLS,
+    PROJECT_ROOT,
+    PUBLIC_TEST_SIZE,
+    RESULTS_DIR,
+    SEED,
+    TARGET,
+    TRADING_DAYS,
+    set_seed,
+)
+from .data import (
+    HullData,
+    excess_returns,
+    get_feature_columns,
+    impute,
+    load_dataset,
+    past_returns,
+)
+from .features import (
+    LAG_PERIODS,
+    ROLLING_WINDOWS,
+    add_cross_terms,
+    add_lag_roll_features,
+    add_price_features,
+    blend_signals,
+    build_features,
+    inverse_vol_weights,
+    top_features_by_gain,
+)
+from .metrics import (
+    aggregate_folds,
+    evaluate,
+    hull_score,
+    modified_sharpe,
+    rmse,
+    r2,
+    sharpe,
+    spearman_ic,
+    strategy_returns,
+)
+from .results import (
+    compare,
+    load_predictions,
+    load_results,
+    save_predictions,
+    save_result,
+)
+from .validation import (
+    Fold,
+    PurgedTimeSeriesSplit,
+    assert_no_leakage,
+    describe_folds,
+    get_folds,
+)
 
-__all__ = ["config", "data", "features", "validation", "metrics", "allocation", "experiment"]
+__all__ = [
+    "SEED",
+    "TARGET",
+    "DATE_COL",
+    "TRADING_DAYS",
+    "PUBLIC_TEST_SIZE",
+    "LOOKAHEAD_COLS",
+    "PROJECT_ROOT",
+    "DATA_DIR",
+    "RESULTS_DIR",
+    "ARTIFACT_DIR",
+    "CV_N_SPLITS",
+    "CV_PURGE",
+    "CV_EMBARGO",
+    "set_seed",
+    "HullData",
+    "load_dataset",
+    "impute",
+    "past_returns",
+    "excess_returns",
+    "get_feature_columns",
+    "build_features",
+    "add_cross_terms",
+    "add_price_features",
+    "add_lag_roll_features",
+    "inverse_vol_weights",
+    "blend_signals",
+    "top_features_by_gain",
+    "LAG_PERIODS",
+    "ROLLING_WINDOWS",
+    "get_folds",
+    "describe_folds",
+    "assert_no_leakage",
+    "Fold",
+    "PurgedTimeSeriesSplit",
+    "evaluate",
+    "aggregate_folds",
+    "rmse",
+    "r2",
+    "spearman_ic",
+    "sharpe",
+    "modified_sharpe",
+    "hull_score",
+    "strategy_returns",
+    "naive_allocation",
+    "binary_allocation",
+    "vol_target_allocation",
+    "smooth_weights",
+    "realised_vol",
+    "save_result",
+    "load_results",
+    "compare",
+    "save_predictions",
+    "load_predictions",
+]

@@ -1,16 +1,6 @@
-# data (never commit competition data)
-data/*
-!data/README.md
-
-# python
+data/raw/*
+!data/raw/.gitkeep
+results/
 __pycache__/
-*.py[cod]
-.venv/
-venv/
+*.pyc
 .ipynb_checkpoints/
-
-# artefacts
-*.pkl
-*.joblib
-*.log
-.optuna/

@@ -1,111 +1,83 @@
-"""Position sizing: turning a return forecast into an allocation in ``[0, 2]``.
+"""
+Position sizing: turning a prediction into an allocation in [0, 2].
 
-The competition is as much a portfolio-construction problem as a forecasting problem, so
-the sizing rule is treated as a first-class, separately evaluated component.
+Three rules, matching the three strategies the write-ups converged on. Keeping
+them here means every notebook scores the *same* mapping from signal to weight,
+so differences in the leaderboard come from the model, not from a bespoke sizer.
 
-* :func:`binary_allocation` - the 61st-place policy: cash or full market exposure.
-  A hard form of regularisation that refuses to read meaning into small forecast gaps.
-* :func:`naive_linear_allocation` - ``clip(1 + k * pred, 0, 2)``: a single-parameter,
-  hard-to-overfit rule.  This is the "safe post-processing" used in Stage 3.
-* :func:`vol_target_allocation` - the 4th-place overlay: rescale exposure so realised
-  strategy volatility sits just below the metric's 120% ceiling.
-* :func:`smooth_positions` - EWM smoothing plus a transaction-cost haircut, which cuts
-  turnover and acts as a low-pass filter on a noisy signal.
+Attribution
+-----------
+* :func:`naive_allocation` - the safe, non-overfitting rule specified for
+  Stage 3, in the spirit of the 100th place write-up's metric-anchored sizing.
+* :func:`binary_allocation` - the 61st place policy: risk-free or fully
+  invested, nothing in between, as a form of regularisation.
+* :func:`vol_target_allocation` - the 4th place volatility-targeting overlay,
+  which that author credits with more leaderboard gain than the alpha itself.
 """
 
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 
-from .config import MAX_POSITION, MIN_POSITION, VOL_CEILING_RATIO
+from .config import TRADING_DAYS
 
-__all__ = [
-    "binary_allocation",
-    "naive_linear_allocation",
-    "vol_target_allocation",
-    "smooth_positions",
-    "tune_naive_k",
-]
+W_MIN, W_MAX = 0.0, 2.0
 
 
-def binary_allocation(preds, threshold: float = 0.0) -> np.ndarray:
-    """0 = risk-free asset, 1 = normal market exposure (61st-place policy)."""
-    p = np.asarray(preds, dtype=float).ravel()
-    return (p > threshold).astype(float)
+def naive_allocation(prediction: np.ndarray, k: float = 1.0) -> np.ndarray:
+    """``clip(1 + k * prediction, 0, 2)``.
 
-
-def naive_linear_allocation(
-    preds,
-    k: float = 100.0,
-    lo: float = MIN_POSITION,
-    hi: float = MAX_POSITION,
-) -> np.ndarray:
-    """``position = clip(1 + k * prediction, 0, 2)``.
-
-    One parameter, monotone in the forecast, centred on the passive ``w = 1`` baseline,
-    which is already a strong benchmark under the competition metric.
+    Centred on the passive ``w = 1`` benchmark, which is already strong under
+    this metric, and tilts away from it in proportion to the signal. One
+    parameter, no fitting.
     """
-    p = np.asarray(preds, dtype=float).ravel()
-    return np.clip(1.0 + k * p, lo, hi)
+    return np.clip(1.0 + k * np.asarray(prediction, float), W_MIN, W_MAX)
+
+
+def binary_allocation(prediction: np.ndarray, threshold: float = 0.0) -> np.ndarray:
+    """Fully invested when the signal clears ``threshold``, risk-free otherwise."""
+    return (np.asarray(prediction, float) > threshold).astype(float)
 
 
 def vol_target_allocation(
-    preds,
-    vol_estimate,
-    market_vol,
-    k: float = 100.0,
-    ceiling: float = VOL_CEILING_RATIO,
-    lo: float = MIN_POSITION,
-    hi: float = MAX_POSITION,
+    prediction: np.ndarray,
+    realised_vol: np.ndarray,
+    target_vol: float = 0.12,
+    k: float = 1.0,
 ) -> np.ndarray:
-    """Scale the naive position by ``target_vol / estimated_vol`` and clip.
+    """Scale a naive tilt by ``target_vol / realised_vol``.
 
-    ``target_vol`` is anchored to ``ceiling * market_vol`` - the same 1.2 that appears in
-    the metric - so the strategy aims just below the penalty cliff instead of at an
-    arbitrary volatility level.
+    ``realised_vol`` should be an *annualised* backward-looking estimate (e.g.
+    the ``vol_20`` column from :mod:`src.features`). Deliberately computed over
+    a long window so leverage does not chase short-lived noise.
     """
-    raw = naive_linear_allocation(preds, k=k, lo=-np.inf, hi=np.inf)
-    vol = np.asarray(vol_estimate, dtype=float).ravel()
-    vol = np.where(np.isfinite(vol) & (vol > 1e-8), vol, np.nan)
-    target = ceiling * float(market_vol)
-    lev = np.nan_to_num(target / vol, nan=1.0, posinf=1.0)
-    return np.clip(raw * lev, lo, hi)
+    base = 1.0 + k * np.asarray(prediction, float)
+    vol = np.asarray(realised_vol, float)
+    leverage = np.divide(
+        target_vol, vol, out=np.ones_like(vol), where=(vol > 0) & np.isfinite(vol)
+    )
+    return np.clip(base * leverage, W_MIN, W_MAX)
 
 
-def smooth_positions(
-    positions,
-    alpha: float = 0.75,
-    transaction_cost: float = 3e-5,
-    init: float = 1.0,
-) -> np.ndarray:
-    """EWM smoothing ``w_t = a * w_t + (1 - a) * w_{t-1}`` with a small cost haircut."""
-    p = np.asarray(positions, dtype=float).ravel()
-    out = np.empty_like(p)
-    prev = float(init)
-    for i, x in enumerate(p):
-        cur = (alpha * x + (1.0 - alpha) * prev) * (1.0 - transaction_cost)
-        out[i] = cur
-        prev = cur
-    return np.clip(out, MIN_POSITION, MAX_POSITION)
+def smooth_weights(weights: np.ndarray, alpha: float = 0.25) -> np.ndarray:
+    """Exponential smoothing of the weight path to cut turnover.
 
-
-def tune_naive_k(
-    preds,
-    market_returns,
-    risk_free=None,
-    grid=(10, 25, 50, 100, 150, 200, 300, 500),
-) -> tuple[float, float]:
-    """Pick ``k`` by penalised Sharpe.
-
-    Must only ever be called on **in-sample / training-fold** data - the notebooks tune it
-    on the training part of each fold and apply the frozen value to the validation block.
+    ``alpha`` is the weight on the new value, so 0.25 means 75/25 in favour of
+    the previous allocation.
     """
-    from .metrics import penalised_sharpe
+    return (
+        pd.Series(np.asarray(weights, float))
+        .ewm(alpha=alpha, adjust=False)
+        .mean()
+        .to_numpy()
+    )
 
-    best_k, best_score = float(grid[0]), -np.inf
-    for k in grid:
-        pos = naive_linear_allocation(preds, k=float(k))
-        score = penalised_sharpe(pos, market_returns, risk_free)
-        if np.isfinite(score) and score > best_score:
-            best_k, best_score = float(k), float(score)
-    return best_k, best_score
+
+def realised_vol(returns: np.ndarray, window: int = 20) -> np.ndarray:
+    """Annualised backward-looking volatility of a *already lagged* return series."""
+    series = pd.Series(np.asarray(returns, float))
+    return (
+        series.rolling(window, min_periods=max(2, window // 4)).std()
+        * np.sqrt(TRADING_DAYS)
+    ).to_numpy()
