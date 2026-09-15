@@ -15,8 +15,6 @@ Only the public phase is in scope; the forecasting phase / evaluation API is
 deliberately out of scope for this project.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from pathlib import Path
 

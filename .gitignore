@@ -1,5 +1,8 @@
+data/raw/*
 !data/raw/.gitkeep
 results/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+catboost_info
+.nocommit

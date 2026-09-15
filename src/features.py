@@ -22,8 +22,6 @@ built from that shifted series via :func:`src.data.past_returns`; rolling
 windows then look strictly backwards. No function here reads the target.
 """
 
-from __future__ import annotations
-
 import numpy as np
 import pandas as pd
 

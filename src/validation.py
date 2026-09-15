@@ -20,8 +20,6 @@ The folds are a deterministic function of the number of rows only, so two
 notebooks operating on the same dataframe get byte-identical splits.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 import numpy as np

@@ -12,19 +12,21 @@ Two families, and they answer different questions:
 
 Attribution
 -----------
-The volatility-ceiling reading of the competition metric (no reward below the
-ceiling, only punishment above it; underperformance vs buy-and-hold penalised
-super-linearly) follows the public 100th place write-up.
+:func:`modified_sharpe` mirrors the organisers' ``metric.py`` (``score()``)
+formula directly: geometric-mean excess return, volatility and return-shortfall
+penalties applied as *divisors* rather than subtracted, and the same 1.2x
+volatility ceiling. If the official ``metric.py`` is importable,
+:func:`hull_score` uses it instead and says so; the two should now agree to
+floating-point precision on any well-posed input.
 
 .. warning::
-   :func:`modified_sharpe` is a **documented re-implementation**, not the
-   organisers' code. If the official ``metric.py`` shipped with the competition
-   is importable, :func:`hull_score` uses it instead and says so. Treat the
-   fallback as a consistent internal yardstick for ranking our own models, not
-   as a leaderboard predictor.
+   The organisers' function raises on degenerate inputs (zero-variance
+   strategy or market returns, positions outside ``[0, 2]``). This
+   re-implementation never raises: those cases are physically impossible for a
+   ranking task and would otherwise crash a fold mid-search, so they are
+   instead scored with a large fixed penalty (see ``_DEGENERATE_SCORE``) that
+   sorts below any real strategy.
 """
-
-from __future__ import annotations
 
 import warnings
 from typing import Any
@@ -36,6 +38,12 @@ from scipy.stats import spearmanr
 from .config import TRADING_DAYS
 
 VOL_CEILING = 1.2  # strategy vol above 120% of market vol is penalised
+
+#: Score assigned to a degenerate input (zero-variance strategy or market
+#: returns) in place of the organisers' exception. Sorts below any real
+#: strategy - modified_sharpe's official divisor form can't go much below 0 for
+#: a non-degenerate input, so this is an unambiguous floor, not just "very low".
+_DEGENERATE_SCORE = -1e6
 
 # --------------------------------------------------------------------------
 # Prediction metrics
@@ -116,36 +124,53 @@ def modified_sharpe(
     vol_ceiling: float = VOL_CEILING,
     return_components: bool = False,
 ) -> float | dict[str, float]:
-    """Volatility-penalised Sharpe - internal approximation of the official metric.
+    """Volatility- and shortfall-penalised Sharpe, matching the organisers'
+    ``metric.py`` formula structure.
 
-    Strategy excess volatility up to ``vol_ceiling`` times market excess
-    volatility is free; above it, the Sharpe is scaled down by the overshoot
-    ratio. Returning less than buy-and-hold adds a quadratic penalty term.
+    ``sharpe / (vol_penalty * return_penalty)``, both penalties >= 1 and
+    applied as *divisors* - not subtracted - so the sign of the score is always
+    the sign of the raw Sharpe. Mean excess return is **geometric**
+    (``(1+r).cumprod() ** (1/n) - 1``), not arithmetic, and volatility is the
+    std of the *raw* strategy/market returns, not of their excess series -
+    both match the official implementation exactly.
+
+    Strategy volatility up to ``vol_ceiling`` (1.2x market) is free; above it,
+    ``vol_penalty = 1 + (vol_ratio - vol_ceiling)``. Underperforming
+    buy-and-hold on annualised mean return adds a quadratic
+    ``return_penalty = 1 + shortfall_pct**2 / 100``, zero if at or above it.
+
+    A zero-variance strategy or market series would make the official function
+    raise; this returns ``_DEGENERATE_SCORE`` instead, since a search that hits
+    this case should be steered away from it, not crashed.
     """
     strat = strategy_returns(weights, forward_returns, risk_free_rate)
+    fwd = np.asarray(forward_returns, float)
     rf = np.asarray(risk_free_rate, float)
-    strat_excess = strat - rf
-    market_excess = np.asarray(forward_returns, float) - rf
+    n = len(strat)
 
-    base = sharpe(strat_excess)
-    vol_s = np.std(strat_excess, ddof=1)
-    vol_m = np.std(market_excess, ddof=1)
-    vol_ratio = float(vol_s / vol_m) if vol_m > 0 else float("inf")
+    strat_std = np.std(strat, ddof=1)
+    market_std = np.std(fwd, ddof=1)
 
-    # Cliff, not a target: zero penalty below the ceiling.
-    overshoot = max(0.0, vol_ratio / vol_ceiling - 1.0)
-    vol_penalty = 1.0 / (1.0 + overshoot)
+    if strat_std == 0 or not np.isfinite(strat_std) or market_std == 0 or not np.isfinite(market_std):
+        base, vol_ratio, vol_penalty, ret_penalty = 0.0, float("nan"), float("nan"), float("nan")
+        score = _DEGENERATE_SCORE
+    else:
+        strat_excess = strat - rf
+        strat_mean_excess = float(np.prod(1.0 + strat_excess) ** (1.0 / n) - 1.0)
+        base = strat_mean_excess / strat_std * np.sqrt(TRADING_DAYS)
 
-    # Quadratic underperformance penalty vs buy-and-hold; zero if we are above.
-    # Both terms are annualised so the penalty is on the same scale as the
-    # Sharpe it is subtracted from. Expressed in units of market volatility.
-    shortfall = max(
-        0.0, float(np.mean(market_excess) - np.mean(strat_excess)) * TRADING_DAYS
-    )
-    scale = annualised_volatility(market_excess, periods=TRADING_DAYS) or 1.0
-    ret_penalty = (shortfall / scale) ** 2
+        market_excess = fwd - rf
+        market_mean_excess = float(np.prod(1.0 + market_excess) ** (1.0 / n) - 1.0)
 
-    score = base * vol_penalty - ret_penalty
+        # (strat_std * sqrt(TRADING_DAYS) * 100) / (market_std * ...) reduces
+        # to strat_std / market_std - the scaling cancels.
+        vol_ratio = float(strat_std / market_std)
+        vol_penalty = 1.0 + max(0.0, vol_ratio - vol_ceiling)
+
+        return_gap_pct = max(0.0, (market_mean_excess - strat_mean_excess) * 100.0 * TRADING_DAYS)
+        ret_penalty = 1.0 + (return_gap_pct ** 2) / 100.0
+
+        score = min(base / (vol_penalty * ret_penalty), 1_000_000.0)
 
     if not return_components:
         return float(score)

@@ -18,9 +18,12 @@ See INTERFACE.md at the project root for the usage contract.
 
 from .allocation import (
     binary_allocation,
+    calibrate_k,
+    causal_standardise,
     naive_allocation,
     realised_vol,
     smooth_weights,
+    vol_budget_allocation,
     vol_target_allocation,
 )
 from .config import (
@@ -131,6 +134,9 @@ __all__ = [
     "naive_allocation",
     "binary_allocation",
     "vol_target_allocation",
+    "vol_budget_allocation",
+    "calibrate_k",
+    "causal_standardise",
     "smooth_weights",
     "realised_vol",
     "save_result",
