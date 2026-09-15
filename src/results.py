@@ -96,10 +96,12 @@ def compare(
     # bare metric name; accept either so both appear in one table.
     candidates = [c for h in HEADLINE for c in (h, h.replace("_mean", ""))]
     cols = columns or list(dict.fromkeys(c for c in candidates if c in frame.columns))
-    sort_key = next(
-        (k for k in ("spearman_ic_mean", "spearman_ic") if k in frame.columns), cols[0]
+    sort_key = (
+        *(k for k in ("modified_sharpe_mean", "modified_sharpe") if k in frame.columns),
+        *(k for k in ("spearman_ic_mean", "spearman_ic") if k in frame.columns), 
+        cols[0]
     )
-    return frame[cols].sort_values(sort_key, ascending=False).reset_index(drop=True)
+    return frame[cols].sort_values(by=sort_key, ascending=False).reset_index(drop=True)
 
 
 def save_predictions(

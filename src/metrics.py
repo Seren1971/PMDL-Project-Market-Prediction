@@ -20,12 +20,16 @@ volatility ceiling. If the official ``metric.py`` is importable,
 floating-point precision on any well-posed input.
 
 .. warning::
-   The organisers' function raises on degenerate inputs (zero-variance
-   strategy or market returns, positions outside ``[0, 2]``). This
-   re-implementation never raises: those cases are physically impossible for a
-   ranking task and would otherwise crash a fold mid-search, so they are
-   instead scored with a large fixed penalty (see ``_DEGENERATE_SCORE``) that
-   sorts below any real strategy.
+   The organisers' function raises on degenerate inputs: zero-variance
+   strategy/market returns, or positions outside ``[0, 2]``. This
+   re-implementation never raises. Zero-variance inputs go straight to
+   ``_DEGENERATE_SCORE`` (see that constant). Out-of-bounds positions instead
+   get a *graded* penalty (see ``BOUNDS_MARGIN``): the weights are clipped to
+   ``[0, 2]`` for the real computation, and the result is smoothly blended
+   toward ``_DEGENERATE_SCORE`` as the worst overshoot grows from 0 to
+   ``BOUNDS_MARGIN`` - unpenalised on the boundary, fully degenerate a full
+   unit past it. This gives a search direction back into bounds instead of an
+   instant flat floor regardless of how far out the weights are.
 """
 
 import warnings
@@ -39,11 +43,47 @@ from .config import TRADING_DAYS
 
 VOL_CEILING = 1.2  # strategy vol above 120% of market vol is penalised
 
+MIN_INVESTMENT = 0.0  # matches the organisers' hard floor on position
+MAX_INVESTMENT = 2.0  # matches the organisers' hard ceiling on position
+
+#: Width, in weight units, of the soft margin just outside [MIN_INVESTMENT,
+#: MAX_INVESTMENT] over which the score is smoothly blended down to
+#: _DEGENERATE_SCORE. A weight exactly on the boundary is unpenalised; a
+#: weight this far past the boundary is fully degenerate. Anything in between
+#: gets a graded penalty so a search sees "getting worse" rather than falling
+#: off a cliff, which is what a hard reject would look like to a learner.
+BOUNDS_MARGIN = 1.0
+
 #: Score assigned to a degenerate input (zero-variance strategy or market
 #: returns) in place of the organisers' exception. Sorts below any real
 #: strategy - modified_sharpe's official divisor form can't go much below 0 for
 #: a non-degenerate input, so this is an unambiguous floor, not just "very low".
 _DEGENERATE_SCORE = -1e6
+
+
+def _bounds_violation(weights: np.ndarray) -> float:
+    """How far ``weights`` strays outside [MIN_INVESTMENT, MAX_INVESTMENT].
+
+    0.0 if every weight is in-bounds. Otherwise the largest single overshoot,
+    in weight units (e.g. 0.3 if the worst day is 2.3 against a max of 2.0).
+    """
+    w = np.asarray(weights, float)
+    return float(max(0.0, MIN_INVESTMENT - w.min(), w.max() - MAX_INVESTMENT))
+
+
+def _bounds_blend(t: float, softness: float = 4.0) -> float:
+    """Ease (0 at t<=0, 1 at t>=1), biased to stay near 0 until t is close to 1.
+
+    A plain cubic smoothstep interpolates *linearly* in score space, and since
+    _DEGENERATE_SCORE (-1e6) is enormously larger than any real score, even a
+    small blend fraction (e.g. t=0.05 -> smoothstep~0.007) already swamps the
+    real signal - the "safe zone" would be a cliff in all but name. Raising t
+    to a power > 1 keeps the blend near-zero while the weight is only
+    slightly past the boundary, and only pulls sharply toward 1 as t
+    approaches the edge of the margin.
+    """
+    t = min(max(t, 0.0), 1.0)
+    return t ** softness
 
 # --------------------------------------------------------------------------
 # Prediction metrics
@@ -122,6 +162,7 @@ def modified_sharpe(
     forward_returns: np.ndarray,
     risk_free_rate: np.ndarray,
     vol_ceiling: float = VOL_CEILING,
+    bounds_margin: float = BOUNDS_MARGIN,
     return_components: bool = False,
 ) -> float | dict[str, float]:
     """Volatility- and shortfall-penalised Sharpe, matching the organisers'
@@ -142,8 +183,23 @@ def modified_sharpe(
     A zero-variance strategy or market series would make the official function
     raise; this returns ``_DEGENERATE_SCORE`` instead, since a search that hits
     this case should be steered away from it, not crashed.
+
+    Weights outside ``[MIN_INVESTMENT, MAX_INVESTMENT]`` are what the
+    organisers' function rejects outright. Rather than mirror that as a hard
+    cliff - which gives a search no signal about *which direction* is better -
+    the Sharpe/vol/return components above are computed on the weights
+    clipped into range, and the result is then smoothly blended toward
+    ``_DEGENERATE_SCORE`` as the worst single-day overshoot grows from 0 up to
+    ``bounds_margin``. A weight on the boundary is unpenalised; a weight
+    ``bounds_margin`` past it is fully degenerate; in between the penalty
+    grows gradually, so a model that wanders out of bounds sees a worsening
+    score rather than an instant floor.
     """
-    strat = strategy_returns(weights, forward_returns, risk_free_rate)
+    w = np.asarray(weights, float)
+    violation = _bounds_violation(w)
+    w_clipped = np.clip(w, MIN_INVESTMENT, MAX_INVESTMENT)
+
+    strat = strategy_returns(w_clipped, forward_returns, risk_free_rate)
     fwd = np.asarray(forward_returns, float)
     rf = np.asarray(risk_free_rate, float)
     n = len(strat)
@@ -172,6 +228,10 @@ def modified_sharpe(
 
         score = min(base / (vol_penalty * ret_penalty), 1_000_000.0)
 
+    if violation > 0:
+        blend = _bounds_blend(violation / bounds_margin) if bounds_margin > 0 else 1.0
+        score = (1.0 - blend) * score + blend * _DEGENERATE_SCORE
+
     if not return_components:
         return float(score)
     return {
@@ -180,6 +240,7 @@ def modified_sharpe(
         "vol_ratio": vol_ratio,
         "vol_penalty": float(vol_penalty),
         "return_penalty": float(ret_penalty),
+        "bounds_violation": float(violation),
     }
 
 
@@ -207,7 +268,14 @@ def hull_score(
                 {"forward_returns": forward_returns, "risk_free_rate": risk_free_rate}
             )
             submission = pd.DataFrame({"prediction": np.asarray(weights, float)})
-            return float(official(solution, submission, ""))
+            try:
+                return float(official(solution, submission, ""))
+            except Exception:
+                # The organisers' function raises on exactly the degenerate
+                # inputs modified_sharpe is built to score smoothly instead
+                # (out-of-bounds weights, zero-variance strategy/market).
+                # Falling through here is what keeps a fold from crashing.
+                pass
     return float(modified_sharpe(weights, forward_returns, risk_free_rate))
 
 
