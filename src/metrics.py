@@ -23,12 +23,10 @@ score for degenerate strategies instead of crashing an optimisation run.
 
 from __future__ import annotations
 
-import warnings
 from typing import Any, Literal, TypedDict, overload
 
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
 
 from .config import TRADING_DAYS
 
@@ -103,38 +101,48 @@ def spearman_ic(
     y_true: np.ndarray,
     y_pred: np.ndarray,
 ) -> float:
-    """
-    Rank information coefficient.
-
-    Spearman correlation is useful for financial-return prediction because
-    ranking relatively strong and weak opportunities can be more stable than
-    predicting exact return magnitudes.
-    """
+    """Rank information coefficient (Pearson correlation of average ranks)."""
     true = np.asarray(y_true, dtype=float)
     pred = np.asarray(y_pred, dtype=float)
 
-    if len(true) < 3:
+    finite = (
+        np.isfinite(true)
+        & np.isfinite(pred)
+    )
+
+    true = true[finite]
+    pred = pred[finite]
+
+    if (
+        len(true) < 3
+        or np.std(pred) == 0
+    ):
         return 0.0
 
-    if np.std(pred) == 0:
-        return 0.0
+    true_rank = (
+        pd.Series(true)
+        .rank(method="average")
+        .to_numpy(dtype=float)
+    )
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+    pred_rank = (
+        pd.Series(pred)
+        .rank(method="average")
+        .to_numpy(dtype=float)
+    )
 
-        result = spearmanr(
-            true,
-            pred,
-        )
+    correlation = float(
+        np.corrcoef(
+            true_rank,
+            pred_rank,
+        )[0, 1]
+    )
 
-    # scipy's result object behaves like a tuple. Indexing avoids Pylance
-    # compatibility issues between different scipy type stubs.
-    rho = float(result[0])
-
-    if not np.isfinite(rho):
-        return 0.0
-
-    return rho
+    return (
+        correlation
+        if np.isfinite(correlation)
+        else 0.0
+    )
 
 
 def hit_rate(
@@ -147,7 +155,8 @@ def hit_rate(
 
     return float(
         np.mean(
-            np.sign(true) == np.sign(pred)
+            np.sign(true)
+            == np.sign(pred)
         )
     )
 
@@ -215,7 +224,10 @@ def sharpe(
         )
     )
 
-    if std == 0 or not np.isfinite(std):
+    if (
+        std == 0
+        or not np.isfinite(std)
+    ):
         return 0.0
 
     mean = float(
@@ -223,7 +235,9 @@ def sharpe(
     )
 
     return float(
-        mean / std * np.sqrt(periods)
+        mean
+        / std
+        * np.sqrt(periods)
     )
 
 
@@ -251,7 +265,8 @@ def annualised_volatility(
         return 0.0
 
     return float(
-        std * np.sqrt(periods)
+        std
+        * np.sqrt(periods)
     )
 
 
@@ -268,7 +283,10 @@ def cumulative_return(
         return 0.0
 
     return float(
-        np.prod(1.0 + values) - 1.0
+        np.prod(
+            1.0 + values
+        )
+        - 1.0
     )
 
 
@@ -308,7 +326,8 @@ def max_drawdown(
     )
 
     drawdowns = (
-        equity / peaks - 1.0
+        equity / peaks
+        - 1.0
     )
 
     return float(
@@ -362,23 +381,6 @@ def modified_sharpe(
     2. Return-shortfall penalty
        Applied when the strategy's geometric excess return is below
        the market's geometric excess return.
-
-    Parameters
-    ----------
-    weights:
-        Portfolio allocations in [0, 2].
-
-    forward_returns:
-        Realised market forward returns.
-
-    risk_free_rate:
-        Daily risk-free returns.
-
-    vol_ceiling:
-        Free volatility-ratio threshold.
-
-    return_components:
-        If True, return all intermediate score components.
     """
     allocation = np.asarray(
         weights,
@@ -408,7 +410,9 @@ def modified_sharpe(
     if len(allocation) < 2:
         if return_components:
             return ModifiedSharpeComponents(
-                modified_sharpe=float(_DEGENERATE_SCORE),
+                modified_sharpe=float(
+                    _DEGENERATE_SCORE
+                ),
                 sharpe=0.0,
                 vol_ratio=float("nan"),
                 vol_penalty=float("nan"),
@@ -452,76 +456,92 @@ def modified_sharpe(
         )
 
         raw_sharpe = 0.0
-
         vol_ratio = float("nan")
         vol_penalty = float("nan")
         return_penalty = float("nan")
 
     else:
         strategy_excess = (
-            strategy - risk_free
+            strategy
+            - risk_free
         )
 
         market_excess = (
-            market - risk_free
+            market
+            - risk_free
         )
 
         strategy_growth = float(
             np.prod(
-                1.0 + strategy_excess
+                1.0
+                + strategy_excess
             )
         )
 
         market_growth = float(
             np.prod(
-                1.0 + market_excess
+                1.0
+                + market_excess
             )
         )
 
-        # Values <= 0 make the geometric return undefined.
         if (
             strategy_growth <= 0
             or market_growth <= 0
-            or not np.isfinite(strategy_growth)
-            or not np.isfinite(market_growth)
+            or not np.isfinite(
+                strategy_growth
+            )
+            or not np.isfinite(
+                market_growth
+            )
         ):
             score = float(
                 _DEGENERATE_SCORE
             )
 
             raw_sharpe = 0.0
-
             vol_ratio = float("nan")
             vol_penalty = float("nan")
             return_penalty = float("nan")
 
         else:
             strategy_mean_excess = float(
-                strategy_growth ** (1.0 / n_rows)
+                strategy_growth
+                ** (
+                    1.0
+                    / n_rows
+                )
                 - 1.0
             )
 
             market_mean_excess = float(
-                market_growth ** (1.0 / n_rows)
+                market_growth
+                ** (
+                    1.0
+                    / n_rows
+                )
                 - 1.0
             )
 
             raw_sharpe = float(
                 strategy_mean_excess
                 / strategy_std
-                * np.sqrt(TRADING_DAYS)
+                * np.sqrt(
+                    TRADING_DAYS
+                )
             )
 
-            # Annualisation cancels when computing the ratio.
             vol_ratio = float(
-                strategy_std / market_std
+                strategy_std
+                / market_std
             )
 
             vol_penalty = float(
                 1.0
                 + max(
                     0.0,
-                    vol_ratio - vol_ceiling,
+                    vol_ratio
+                    - vol_ceiling,
                 )
             )
 
@@ -539,7 +559,8 @@ def modified_sharpe(
 
             return_penalty = float(
                 1.0
-                + return_gap_pct**2 / 100.0
+                + return_gap_pct**2
+                / 100.0
             )
 
             score = float(
@@ -557,11 +578,21 @@ def modified_sharpe(
         return float(score)
 
     return ModifiedSharpeComponents(
-        modified_sharpe=float(score),
-        sharpe=float(raw_sharpe),
-        vol_ratio=float(vol_ratio),
-        vol_penalty=float(vol_penalty),
-        return_penalty=float(return_penalty),
+        modified_sharpe=float(
+            score
+        ),
+        sharpe=float(
+            raw_sharpe
+        ),
+        vol_ratio=float(
+            vol_ratio
+        ),
+        vol_penalty=float(
+            vol_penalty
+        ),
+        return_penalty=float(
+            return_penalty
+        ),
     )
 
 
@@ -740,20 +771,27 @@ def evaluate(
                 strategy
             ),
             "benchmark_sharpe": sharpe(
-                market - risk_free
+                market
+                - risk_free
             ),
             "mean_weight": float(
-                np.mean(allocation)
-            ),
-            "weight_turnover": float(
                 np.mean(
-                    np.abs(
-                        np.diff(allocation)
+                    allocation
+                )
+            ),
+            "weight_turnover": (
+                float(
+                    np.mean(
+                        np.abs(
+                            np.diff(
+                                allocation
+                            )
+                        )
                     )
                 )
-            )
-            if len(allocation) > 1
-            else 0.0,
+                if len(allocation) > 1
+                else 0.0
+            ),
         }
     )
 
@@ -766,7 +804,12 @@ def evaluate(
 
 
 def aggregate_folds(
-    fold_metrics: list[dict[str, Any]],
+    fold_metrics: list[
+        dict[
+            str,
+            Any,
+        ]
+    ],
 ) -> dict[str, Any]:
     """
     Aggregate fold-level metrics.
@@ -785,7 +828,9 @@ def aggregate_folds(
 
     output: dict[str, Any] = {
         "n_folds": int(
-            len(fold_metrics)
+            len(
+                fold_metrics
+            )
         )
     }
 
@@ -800,11 +845,15 @@ def aggregate_folds(
             errors="coerce",
         )
 
-        output[f"{column}_mean"] = float(
+        output[
+            f"{column}_mean"
+        ] = float(
             values.mean()
         )
 
-        output[f"{column}_std"] = float(
+        output[
+            f"{column}_std"
+        ] = float(
             values.std(
                 ddof=0
             )
