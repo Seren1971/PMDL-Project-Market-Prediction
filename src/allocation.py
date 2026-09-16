@@ -1,26 +1,8 @@
 """
 Position sizing: turning a prediction into an allocation in [0, 2].
 
-Three rules, matching the three strategies the write-ups converged on. Keeping
-them here means every notebook scores the *same* mapping from signal to weight,
-so differences in the leaderboard come from the model, not from a bespoke sizer.
-
-Attribution
------------
-* :func:`naive_allocation` - the safe, non-overfitting rule specified for
-  Stage 3, in the spirit of the 100th place write-up's metric-anchored sizing.
-* :func:`binary_allocation` - the 61st place policy: risk-free or fully
-  invested, nothing in between, as a form of regularisation.
-* :func:`vol_target_allocation` - the 4th place volatility-targeting overlay,
-  which that author credits with more leaderboard gain than the alpha itself.
-* :func:`vol_budget_allocation` - a 100th-place-style refinement of the naive
-  rule: the tilt away from the passive ``w = 1`` benchmark is scaled by
-  realised volatility instead of a fixed constant, so leverage adapts to the
-  current regime instead of being fitted once and frozen.
-* :func:`calibrate_k` - sets :func:`naive_allocation`'s ``k`` by a volatility
-  constraint (bisection), not by searching the score.
-* :func:`causal_standardise` - expanding, leak-free rescaling of a signal at
-  inference time, seeded by frozen out-of-fold statistics.
+All allocation rules live here so every model uses the same mapping from
+prediction signal to portfolio exposure.
 """
 
 import numpy as np
@@ -28,22 +10,33 @@ import pandas as pd
 
 from .config import TRADING_DAYS
 
-W_MIN, W_MAX = 0.0, 2.0
+
+W_MIN = 0.0
+W_MAX = 2.0
 
 
-def naive_allocation(prediction: np.ndarray, k: float = 1.0) -> np.ndarray:
-    """``clip(1 + k * prediction, 0, 2)``.
+def naive_allocation(
+    prediction: np.ndarray,
+    k: float = 1.0,
+) -> np.ndarray:
+    """Convert a prediction into an allocation centred around w=1."""
+    prediction = np.asarray(prediction, dtype=float)
 
-    Centred on the passive ``w = 1`` benchmark, which is already strong under
-    this metric, and tilts away from it in proportion to the signal. One
-    parameter, no fitting.
-    """
-    return np.clip(1.0 + k * np.asarray(prediction, float), W_MIN, W_MAX)
+    return np.clip(
+        1.0 + k * prediction,
+        W_MIN,
+        W_MAX,
+    )
 
 
-def binary_allocation(prediction: np.ndarray, threshold: float = 0.0) -> np.ndarray:
-    """Fully invested when the signal clears ``threshold``, risk-free otherwise."""
-    return (np.asarray(prediction, float) > threshold).astype(float)
+def binary_allocation(
+    prediction: np.ndarray,
+    threshold: float = 0.0,
+) -> np.ndarray:
+    """Use full market exposure when prediction exceeds the threshold."""
+    prediction = np.asarray(prediction, dtype=float)
+
+    return (prediction > threshold).astype(float)
 
 
 def vol_target_allocation(
@@ -52,18 +45,28 @@ def vol_target_allocation(
     target_vol: float = 0.12,
     k: float = 1.0,
 ) -> np.ndarray:
-    """Scale a naive tilt by ``target_vol / realised_vol``.
-
-    ``realised_vol`` should be an *annualised* backward-looking estimate (e.g.
-    the ``vol_20`` column from :mod:`src.features`). Deliberately computed over
-    a long window so leverage does not chase short-lived noise.
     """
-    base = 1.0 + k * np.asarray(prediction, float)
-    vol = np.asarray(realised_vol, float)
+    Scale the complete position according to realised volatility.
+
+    This function is kept for compatibility with the existing project code.
+    """
+    prediction = np.asarray(prediction, dtype=float)
+    vol = np.asarray(realised_vol, dtype=float)
+
+    base = 1.0 + k * prediction
+
     leverage = np.divide(
-        target_vol, vol, out=np.ones_like(vol), where=(vol > 0) & np.isfinite(vol)
+        target_vol,
+        vol,
+        out=np.ones_like(vol),
+        where=(vol > 0) & np.isfinite(vol),
     )
-    return np.clip(base * leverage, W_MIN, W_MAX)
+
+    return np.clip(
+        base * leverage,
+        W_MIN,
+        W_MAX,
+    )
 
 
 def vol_budget_allocation(
@@ -71,27 +74,140 @@ def vol_budget_allocation(
     realised_vol: np.ndarray,
     target_vol: float = 0.12,
 ) -> np.ndarray:
-    """Scale the *tilt* away from ``w = 1`` to a fixed annualised vol budget.
-
-    ``raw_position`` is an unscaled naive position, typically
-    ``1 + prediction`` (i.e. :func:`naive_allocation` with ``k=1``). Unlike
-    :func:`vol_target_allocation`, which multiplies the whole position
-    (including the passive ``1``) by ``target_vol / realised_vol``, this
-    function levers only the deviation from the benchmark - so a day with no
-    signal still sits at ``w = 1`` regardless of the current vol regime, and
-    only the *size* of a real tilt responds to it.
-
-    This has no fitted parameter: nothing here is chosen against the score, and
-    the leverage adapts day to day instead of being frozen at one constant
-    ``k`` for every regime the way :func:`naive_allocation` is.
     """
-    tilt = np.asarray(raw_position, float) - 1.0
-    vol = np.asarray(realised_vol, float)
+    Scale only the active tilt away from the passive w=1 benchmark.
+
+    A zero trading signal therefore remains at allocation 1 regardless
+    of the current volatility regime.
+    """
+    raw_position = np.asarray(raw_position, dtype=float)
+    vol = np.asarray(realised_vol, dtype=float)
+
+    tilt = raw_position - 1.0
+
     leverage = np.divide(
-        target_vol, vol, out=np.ones_like(vol, dtype=float),
+        target_vol,
+        vol,
+        out=np.ones_like(vol),
         where=(vol > 0) & np.isfinite(vol),
     )
-    return np.clip(1.0 + tilt * leverage, W_MIN, W_MAX)
+
+    return np.clip(
+        1.0 + tilt * leverage,
+        W_MIN,
+        W_MAX,
+    )
+
+
+def risk_controlled_vol_budget_allocation(
+    signal: np.ndarray,
+    realised_volatility: np.ndarray,
+    tilt_scale: float = 1.0,
+    target_vol: float = 0.12,
+) -> np.ndarray:
+    """
+    Apply volatility-aware allocation with an additional risk scale.
+
+    The original vol_budget_allocation adapts exposure to the current
+    volatility regime, but it does not explicitly control the final
+    strategy/market volatility ratio.
+
+    tilt_scale controls only the active part of the position:
+
+        allocation = 1 + tilt_scale * active_tilt
+
+    Therefore:
+        tilt_scale = 0 -> passive allocation 1
+        tilt_scale = 1 -> original volatility-budget allocation
+
+    The scale must be calibrated using training or inner-CV data only.
+    """
+    signal = np.asarray(signal, dtype=float)
+
+    base = vol_budget_allocation(
+        raw_position=1.0 + signal,
+        realised_vol=realised_volatility,
+        target_vol=target_vol,
+    )
+
+    active_tilt = base - 1.0
+
+    return np.clip(
+        1.0 + float(tilt_scale) * active_tilt,
+        W_MIN,
+        W_MAX,
+    )
+
+
+def calibrate_vol_budget_scale(
+    signal: np.ndarray,
+    realised_volatility: np.ndarray,
+    forward_returns: np.ndarray,
+    risk_free_rate: np.ndarray,
+    target_vol_ratio: float = 1.05,
+    target_vol: float = 0.12,
+    max_scale: float = 4.0,
+    n_grid: int = 161,
+) -> float:
+    """
+    Find the largest risk scale that keeps strategy volatility below
+    the requested strategy/market volatility ratio.
+
+    This is intentionally NOT a Sharpe optimisation.
+
+    It is a risk constraint. The function should only receive predictions
+    generated out-of-fold inside the training period.
+
+    A deterministic grid is used because the relationship between scale
+    and realised strategy volatility is not guaranteed to be perfectly
+    monotonic due to signal/market covariance.
+    """
+    from .metrics import modified_sharpe
+
+    if target_vol_ratio <= 0:
+        raise ValueError("target_vol_ratio must be positive")
+
+    if max_scale <= 0:
+        raise ValueError("max_scale must be positive")
+
+    if n_grid < 2:
+        raise ValueError("n_grid must be at least 2")
+
+    candidates = np.linspace(
+        0.0,
+        float(max_scale),
+        int(n_grid),
+    )
+
+    feasible_scales = []
+
+    for scale in candidates:
+        weights = risk_controlled_vol_budget_allocation(
+            signal=signal,
+            realised_volatility=realised_volatility,
+            tilt_scale=float(scale),
+            target_vol=target_vol,
+        )
+
+        components = modified_sharpe(
+            weights,
+            forward_returns,
+            risk_free_rate,
+            return_components=True,
+        )
+
+        vol_ratio = float(components["vol_ratio"])
+
+        if (
+            np.isfinite(vol_ratio)
+            and vol_ratio <= target_vol_ratio
+        ):
+            feasible_scales.append(float(scale))
+
+    if not feasible_scales:
+        return 0.0
+
+    return max(feasible_scales)
 
 
 def calibrate_k(
@@ -103,38 +219,60 @@ def calibrate_k(
     tol: float = 1e-3,
     max_iter: int = 100,
 ) -> float:
-    """Bisect :func:`naive_allocation`'s ``k`` to hit a target strategy /
-    market volatility ratio, instead of searching ``k`` against the score.
-
-    ``vol_ratio`` is monotone increasing in ``k`` (a bigger tilt means more
-    strategy volatility), so bisection is well posed. This is a constraint,
-    not a fitted parameter: nothing here is selected on the metric, so it
-    cannot overfit the objective the way a tuned ``k`` can.
     """
-    from .metrics import strategy_returns  # local import avoids a cycle
+    Calibrate naive-allocation strength using a volatility constraint
+    instead of maximising the competition score.
+    """
+    from .metrics import strategy_returns
 
-    fwd = np.asarray(forward_returns, float)
-    rf = np.asarray(risk_free_rate, float)
-    market_vol = np.std(fwd - rf, ddof=1)
+    prediction = np.asarray(prediction, dtype=float)
+    forward_returns = np.asarray(forward_returns, dtype=float)
+    risk_free_rate = np.asarray(risk_free_rate, dtype=float)
+
+    market_vol = np.std(
+        forward_returns - risk_free_rate,
+        ddof=1,
+    )
+
     if market_vol == 0 or not np.isfinite(market_vol):
         return 1.0
 
-    def vol_ratio(k: float) -> float:
-        strat = strategy_returns(naive_allocation(prediction, k=k), fwd, rf)
-        return float(np.std(strat - rf, ddof=1) / market_vol)
+    def calculate_vol_ratio(k: float) -> float:
+        allocation = naive_allocation(
+            prediction,
+            k=k,
+        )
 
-    lo, hi = k_bounds
-    if vol_ratio(hi) < target_vol_ratio:
-        return hi  # signal too weak to reach the target even at the upper bound
+        strategy = strategy_returns(
+            allocation,
+            forward_returns,
+            risk_free_rate,
+        )
+
+        strategy_vol = np.std(
+            strategy - risk_free_rate,
+            ddof=1,
+        )
+
+        return float(strategy_vol / market_vol)
+
+    lower, upper = k_bounds
+
+    if calculate_vol_ratio(upper) < target_vol_ratio:
+        return upper
+
     for _ in range(max_iter):
-        mid = (lo + hi) / 2.0
-        if vol_ratio(mid) < target_vol_ratio:
-            lo = mid
+        middle = (lower + upper) / 2.0
+
+        if calculate_vol_ratio(middle) < target_vol_ratio:
+            lower = middle
         else:
-            hi = mid
-        if hi - lo < tol:
+            upper = middle
+
+        if upper - lower < tol:
             break
-    return (lo + hi) / 2.0
+
+    return (lower + upper) / 2.0
 
 
 def causal_standardise(
@@ -143,58 +281,80 @@ def causal_standardise(
     warmup_sd: float,
     min_periods: int = 20,
 ) -> np.ndarray:
-    """Expanding-window z-score of ``x``, using only *earlier* rows of ``x``.
-
-    The first ``min_periods`` rows fall back to the frozen ``(warmup_mean,
-    warmup_sd)`` - typically the training-time statistics of the signal being
-    rescaled - since there isn't enough of ``x``'s own history yet to estimate
-    anything. After that, row ``i`` is scaled by the mean/sd of rows
-    ``0..i-1`` only, so no row ever contributes to its own normalisation and
-    nothing here looks ahead.
-
-    Exists because a model refit on the full training period produces a wider
-    prediction spread than its out-of-fold counterpart, so freezing the
-    out-of-fold scale under-controls volatility at inference; this recovers a
-    comparable scale causally, from the held-out block itself.
     """
-    x = np.asarray(x, float)
+    Standardise each observation using only earlier observations.
+
+    During the initial warm-up period, frozen training statistics are used.
+
+    The current row never contributes to its own normalisation.
+    """
+    x = np.asarray(x, dtype=float)
+
     n = len(x)
-    out = np.empty(n, dtype=float)
-    cum_sum, cum_sq = 0.0, 0.0
+    output = np.empty(n, dtype=float)
+
+    cumulative_sum = 0.0
+    cumulative_squared_sum = 0.0
+
     for i in range(n):
         if i < min_periods:
-            mu, sd = warmup_mean, warmup_sd
+            mean = warmup_mean
+            std = warmup_sd
+
         else:
-            mu = cum_sum / i
-            var = max(cum_sq / i - mu * mu, 0.0)
-            sd = var ** 0.5
-            if sd == 0.0 or not np.isfinite(sd):
-                sd = warmup_sd
-        sd = sd if sd > 0 else 1.0
-        out[i] = (x[i] - mu) / sd
-        cum_sum += x[i]
-        cum_sq += x[i] * x[i]
-    return out
+            mean = cumulative_sum / i
+
+            variance = max(
+                cumulative_squared_sum / i - mean * mean,
+                0.0,
+            )
+
+            std = variance ** 0.5
+
+            if std == 0.0 or not np.isfinite(std):
+                std = warmup_sd
+
+        if std <= 0 or not np.isfinite(std):
+            std = 1.0
+
+        output[i] = (x[i] - mean) / std
+
+        cumulative_sum += x[i]
+        cumulative_squared_sum += x[i] * x[i]
+
+    return output
 
 
-def smooth_weights(weights: np.ndarray, alpha: float = 0.25) -> np.ndarray:
-    """Exponential smoothing of the weight path to cut turnover.
+def smooth_weights(
+    weights: np.ndarray,
+    alpha: float = 0.25,
+) -> np.ndarray:
+    """Exponentially smooth the allocation path to reduce turnover."""
+    weights = np.asarray(weights, dtype=float)
 
-    ``alpha`` is the weight on the new value, so 0.25 means 75/25 in favour of
-    the previous allocation.
-    """
     return (
-        pd.Series(np.asarray(weights, float))
+        pd.Series(weights)
         .ewm(alpha=alpha, adjust=False)
         .mean()
         .to_numpy()
     )
 
 
-def realised_vol(returns: np.ndarray, window: int = 20) -> np.ndarray:
-    """Annualised backward-looking volatility of a *already lagged* return series."""
-    series = pd.Series(np.asarray(returns, float))
+def realised_vol(
+    returns: np.ndarray,
+    window: int = 20,
+) -> np.ndarray:
+    """Calculate annualised backward-looking realised volatility."""
+    returns = np.asarray(returns, dtype=float)
+
+    series = pd.Series(returns)
+
     return (
-        series.rolling(window, min_periods=max(2, window // 4)).std()
+        series
+        .rolling(
+            window,
+            min_periods=max(2, window // 4),
+        )
+        .std()
         * np.sqrt(TRADING_DAYS)
     ).to_numpy()

@@ -1,0 +1,9 @@
+{
+    "python.analysis.ignore": [
+        "**/data/raw/**"
+    ],
+    "python.analysis.exclude": [
+        "**/data/raw/**",
+        "**/vr/**"
+    ]
+}

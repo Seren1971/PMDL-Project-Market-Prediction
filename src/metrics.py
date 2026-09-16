@@ -1,35 +1,30 @@
 """
 Evaluation metrics: prediction quality and strategy quality.
 
-Two families, and they answer different questions:
+Two metric families are used:
 
-* **Prediction metrics** (RMSE, R2, Spearman IC) score the regression head.
-  Spearman is the one that matters most - the 61st place solution tuned on mean
-  rank correlation across folds rather than RMSE, on the grounds that ranking
-  good days against bad ones is learnable where the exact magnitude is not.
-* **Strategy metrics** (Sharpe, volatility ratio, modified Sharpe) score the
-  allocation actually submitted, in [0, 2].
+1. Prediction metrics
+   - RMSE
+   - R²
+   - Spearman IC
+   - Hit rate
 
-Attribution
------------
-:func:`modified_sharpe` mirrors the organisers' ``metric.py`` (``score()``)
-formula directly: geometric-mean excess return, volatility and return-shortfall
-penalties applied as *divisors* rather than subtracted, and the same 1.2x
-volatility ceiling. If the official ``metric.py`` is importable,
-:func:`hull_score` uses it instead and says so; the two should now agree to
-floating-point precision on any well-posed input.
+2. Strategy metrics
+   - Raw Sharpe
+   - Strategy volatility
+   - Volatility ratio
+   - Modified competition Sharpe
+   - Maximum drawdown
 
-.. warning::
-   The organisers' function raises on degenerate inputs (zero-variance
-   strategy or market returns, positions outside ``[0, 2]``). This
-   re-implementation never raises: those cases are physically impossible for a
-   ranking task and would otherwise crash a fold mid-search, so they are
-   instead scored with a large fixed penalty (see ``_DEGENERATE_SCORE``) that
-   sorts below any real strategy.
+The modified Sharpe implementation mirrors the public Hull Tactical
+competition metric as closely as possible while returning a large negative
+score for degenerate strategies instead of crashing an optimisation run.
 """
 
+from __future__ import annotations
+
 import warnings
-from typing import Any
+from typing import Any, Literal, TypedDict, overload
 
 import numpy as np
 import pandas as pd
@@ -37,46 +32,124 @@ from scipy.stats import spearmanr
 
 from .config import TRADING_DAYS
 
-VOL_CEILING = 1.2  # strategy vol above 120% of market vol is penalised
 
-#: Score assigned to a degenerate input (zero-variance strategy or market
-#: returns) in place of the organisers' exception. Sorts below any real
-#: strategy - modified_sharpe's official divisor form can't go much below 0 for
-#: a non-degenerate input, so this is an unambiguous floor, not just "very low".
+VOL_CEILING = 1.2
+
+# Used when the strategy or market has zero / invalid variance.
 _DEGENERATE_SCORE = -1e6
+
+
+class ModifiedSharpeComponents(TypedDict):
+    """Detailed output of the modified Sharpe calculation."""
+
+    modified_sharpe: float
+    sharpe: float
+    vol_ratio: float
+    vol_penalty: float
+    return_penalty: float
+
 
 # --------------------------------------------------------------------------
 # Prediction metrics
 # --------------------------------------------------------------------------
 
 
-def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    y_true, y_pred = np.asarray(y_true, float), np.asarray(y_pred, float)
-    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+def rmse(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> float:
+    """Root mean squared error."""
+    true = np.asarray(y_true, dtype=float)
+    pred = np.asarray(y_pred, dtype=float)
+
+    return float(
+        np.sqrt(
+            np.mean(
+                (true - pred) ** 2
+            )
+        )
+    )
 
 
-def r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    y_true, y_pred = np.asarray(y_true, float), np.asarray(y_pred, float)
-    ss_res = np.sum((y_true - y_pred) ** 2)
-    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-    return float(1.0 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
+def r2(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> float:
+    """Standard coefficient of determination."""
+    true = np.asarray(y_true, dtype=float)
+    pred = np.asarray(y_pred, dtype=float)
+
+    ss_res = float(
+        np.sum(
+            (true - pred) ** 2
+        )
+    )
+
+    ss_tot = float(
+        np.sum(
+            (true - np.mean(true)) ** 2
+        )
+    )
+
+    if ss_tot <= 0:
+        return float("nan")
+
+    return float(
+        1.0 - ss_res / ss_tot
+    )
 
 
-def spearman_ic(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Rank information coefficient. The primary tuning objective."""
-    y_true, y_pred = np.asarray(y_true, float), np.asarray(y_pred, float)
-    if np.std(y_pred) == 0 or len(y_true) < 3:
+def spearman_ic(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> float:
+    """
+    Rank information coefficient.
+
+    Spearman correlation is useful for financial-return prediction because
+    ranking relatively strong and weak opportunities can be more stable than
+    predicting exact return magnitudes.
+    """
+    true = np.asarray(y_true, dtype=float)
+    pred = np.asarray(y_pred, dtype=float)
+
+    if len(true) < 3:
         return 0.0
+
+    if np.std(pred) == 0:
+        return 0.0
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        rho = spearmanr(y_true, y_pred).correlation
-    return float(rho) if np.isfinite(rho) else 0.0
+
+        result = spearmanr(
+            true,
+            pred,
+        )
+
+    # scipy's result object behaves like a tuple. Indexing avoids Pylance
+    # compatibility issues between different scipy type stubs.
+    rho = float(result[0])
+
+    if not np.isfinite(rho):
+        return 0.0
+
+    return rho
 
 
-def hit_rate(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Share of rows where the predicted sign matches the realised sign."""
-    y_true, y_pred = np.asarray(y_true, float), np.asarray(y_pred, float)
-    return float(np.mean(np.sign(y_true) == np.sign(y_pred)))
+def hit_rate(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> float:
+    """Share of observations where predicted and realised signs agree."""
+    true = np.asarray(y_true, dtype=float)
+    pred = np.asarray(y_pred, dtype=float)
+
+    return float(
+        np.mean(
+            np.sign(true) == np.sign(pred)
+        )
+    )
 
 
 # --------------------------------------------------------------------------
@@ -85,36 +158,189 @@ def hit_rate(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 
 def strategy_returns(
-    weights: np.ndarray, forward_returns: np.ndarray, risk_free_rate: np.ndarray
+    weights: np.ndarray,
+    forward_returns: np.ndarray,
+    risk_free_rate: np.ndarray,
 ) -> np.ndarray:
-    """Daily strategy return for an allocation ``w`` in [0, 2].
-
-    ``w`` of capital sits in the market, ``1 - w`` in the risk-free asset
-    (negative for ``w > 1``, i.e. leverage financed at the risk-free rate).
     """
-    w = np.asarray(weights, float)
-    fwd = np.asarray(forward_returns, float)
-    rf = np.asarray(risk_free_rate, float)
-    return w * fwd + (1.0 - w) * rf
+    Calculate daily portfolio return for allocation w in [0, 2].
+
+    w = 0:
+        fully risk-free
+
+    w = 1:
+        fully invested in the market
+
+    w = 2:
+        leveraged 2x market position financed at the risk-free rate
+    """
+    allocation = np.asarray(
+        weights,
+        dtype=float,
+    )
+
+    market = np.asarray(
+        forward_returns,
+        dtype=float,
+    )
+
+    risk_free = np.asarray(
+        risk_free_rate,
+        dtype=float,
+    )
+
+    return (
+        allocation * market
+        + (1.0 - allocation) * risk_free
+    )
 
 
-def sharpe(excess: np.ndarray, periods: int = TRADING_DAYS) -> float:
-    """Annualised Sharpe ratio of an excess-return series."""
-    excess = np.asarray(excess, float)
-    sd = np.std(excess, ddof=1)
-    if sd == 0 or not np.isfinite(sd):
+def sharpe(
+    excess: np.ndarray,
+    periods: int = TRADING_DAYS,
+) -> float:
+    """Annualised arithmetic Sharpe ratio."""
+    values = np.asarray(
+        excess,
+        dtype=float,
+    )
+
+    if len(values) < 2:
         return 0.0
-    return float(np.mean(excess) / sd * np.sqrt(periods))
+
+    std = float(
+        np.std(
+            values,
+            ddof=1,
+        )
+    )
+
+    if std == 0 or not np.isfinite(std):
+        return 0.0
+
+    mean = float(
+        np.mean(values)
+    )
+
+    return float(
+        mean / std * np.sqrt(periods)
+    )
 
 
-def annualised_volatility(returns: np.ndarray, periods: int = TRADING_DAYS) -> float:
-    return float(np.std(np.asarray(returns, float), ddof=1) * np.sqrt(periods))
+def annualised_volatility(
+    returns: np.ndarray,
+    periods: int = TRADING_DAYS,
+) -> float:
+    """Annualised volatility of a daily return series."""
+    values = np.asarray(
+        returns,
+        dtype=float,
+    )
+
+    if len(values) < 2:
+        return 0.0
+
+    std = float(
+        np.std(
+            values,
+            ddof=1,
+        )
+    )
+
+    if not np.isfinite(std):
+        return 0.0
+
+    return float(
+        std * np.sqrt(periods)
+    )
 
 
-def max_drawdown(returns: np.ndarray) -> float:
-    curve = np.cumprod(1.0 + np.asarray(returns, float))
-    peak = np.maximum.accumulate(curve)
-    return float(np.min(curve / peak - 1.0))
+def cumulative_return(
+    returns: np.ndarray,
+) -> float:
+    """Compound total return over the supplied period."""
+    values = np.asarray(
+        returns,
+        dtype=float,
+    )
+
+    if len(values) == 0:
+        return 0.0
+
+    return float(
+        np.prod(1.0 + values) - 1.0
+    )
+
+
+def max_drawdown(
+    returns: np.ndarray,
+) -> float:
+    """
+    Maximum peak-to-trough loss.
+
+    Returned as a positive fraction.
+
+    Example:
+        0.10 means a 10% maximum drawdown.
+    """
+    values = np.asarray(
+        returns,
+        dtype=float,
+    )
+
+    if len(values) == 0:
+        return 0.0
+
+    equity = np.concatenate(
+        (
+            np.array(
+                [1.0],
+                dtype=float,
+            ),
+            np.cumprod(
+                1.0 + values
+            ),
+        )
+    )
+
+    peaks = np.maximum.accumulate(
+        equity
+    )
+
+    drawdowns = (
+        equity / peaks - 1.0
+    )
+
+    return float(
+        -np.min(drawdowns)
+    )
+
+
+# --------------------------------------------------------------------------
+# Modified competition Sharpe
+# --------------------------------------------------------------------------
+
+
+@overload
+def modified_sharpe(
+    weights: np.ndarray,
+    forward_returns: np.ndarray,
+    risk_free_rate: np.ndarray,
+    vol_ceiling: float = VOL_CEILING,
+    return_components: Literal[False] = False,
+) -> float:
+    ...
+
+
+@overload
+def modified_sharpe(
+    weights: np.ndarray,
+    forward_returns: np.ndarray,
+    risk_free_rate: np.ndarray,
+    vol_ceiling: float = VOL_CEILING,
+    return_components: Literal[True] = True,
+) -> ModifiedSharpeComponents:
+    ...
 
 
 def modified_sharpe(
@@ -123,73 +349,235 @@ def modified_sharpe(
     risk_free_rate: np.ndarray,
     vol_ceiling: float = VOL_CEILING,
     return_components: bool = False,
-) -> float | dict[str, float]:
-    """Volatility- and shortfall-penalised Sharpe, matching the organisers'
-    ``metric.py`` formula structure.
-
-    ``sharpe / (vol_penalty * return_penalty)``, both penalties >= 1 and
-    applied as *divisors* - not subtracted - so the sign of the score is always
-    the sign of the raw Sharpe. Mean excess return is **geometric**
-    (``(1+r).cumprod() ** (1/n) - 1``), not arithmetic, and volatility is the
-    std of the *raw* strategy/market returns, not of their excess series -
-    both match the official implementation exactly.
-
-    Strategy volatility up to ``vol_ceiling`` (1.2x market) is free; above it,
-    ``vol_penalty = 1 + (vol_ratio - vol_ceiling)``. Underperforming
-    buy-and-hold on annualised mean return adds a quadratic
-    ``return_penalty = 1 + shortfall_pct**2 / 100``, zero if at or above it.
-
-    A zero-variance strategy or market series would make the official function
-    raise; this returns ``_DEGENERATE_SCORE`` instead, since a search that hits
-    this case should be steered away from it, not crashed.
+) -> float | ModifiedSharpeComponents:
     """
-    strat = strategy_returns(weights, forward_returns, risk_free_rate)
-    fwd = np.asarray(forward_returns, float)
-    rf = np.asarray(risk_free_rate, float)
-    n = len(strat)
+    Calculate the Hull Tactical competition-style modified Sharpe score.
 
-    strat_std = np.std(strat, ddof=1)
-    market_std = np.std(fwd, ddof=1)
+    The raw geometric Sharpe is divided by two possible penalties:
 
-    if strat_std == 0 or not np.isfinite(strat_std) or market_std == 0 or not np.isfinite(market_std):
-        base, vol_ratio, vol_penalty, ret_penalty = 0.0, float("nan"), float("nan"), float("nan")
-        score = _DEGENERATE_SCORE
+    1. Volatility penalty
+       Applied when strategy volatility exceeds `vol_ceiling` times
+       market volatility.
+
+    2. Return-shortfall penalty
+       Applied when the strategy's geometric excess return is below
+       the market's geometric excess return.
+
+    Parameters
+    ----------
+    weights:
+        Portfolio allocations in [0, 2].
+
+    forward_returns:
+        Realised market forward returns.
+
+    risk_free_rate:
+        Daily risk-free returns.
+
+    vol_ceiling:
+        Free volatility-ratio threshold.
+
+    return_components:
+        If True, return all intermediate score components.
+    """
+    allocation = np.asarray(
+        weights,
+        dtype=float,
+    )
+
+    market = np.asarray(
+        forward_returns,
+        dtype=float,
+    )
+
+    risk_free = np.asarray(
+        risk_free_rate,
+        dtype=float,
+    )
+
+    if not (
+        len(allocation)
+        == len(market)
+        == len(risk_free)
+    ):
+        raise ValueError(
+            "weights, forward_returns and risk_free_rate "
+            "must have the same length."
+        )
+
+    if len(allocation) < 2:
+        if return_components:
+            return ModifiedSharpeComponents(
+                modified_sharpe=float(_DEGENERATE_SCORE),
+                sharpe=0.0,
+                vol_ratio=float("nan"),
+                vol_penalty=float("nan"),
+                return_penalty=float("nan"),
+            )
+
+        return float(
+            _DEGENERATE_SCORE
+        )
+
+    strategy = strategy_returns(
+        allocation,
+        market,
+        risk_free,
+    )
+
+    n_rows = len(strategy)
+
+    strategy_std = float(
+        np.std(
+            strategy,
+            ddof=1,
+        )
+    )
+
+    market_std = float(
+        np.std(
+            market,
+            ddof=1,
+        )
+    )
+
+    if (
+        strategy_std == 0
+        or not np.isfinite(strategy_std)
+        or market_std == 0
+        or not np.isfinite(market_std)
+    ):
+        score = float(
+            _DEGENERATE_SCORE
+        )
+
+        raw_sharpe = 0.0
+
+        vol_ratio = float("nan")
+        vol_penalty = float("nan")
+        return_penalty = float("nan")
+
     else:
-        strat_excess = strat - rf
-        strat_mean_excess = float(np.prod(1.0 + strat_excess) ** (1.0 / n) - 1.0)
-        base = strat_mean_excess / strat_std * np.sqrt(TRADING_DAYS)
+        strategy_excess = (
+            strategy - risk_free
+        )
 
-        market_excess = fwd - rf
-        market_mean_excess = float(np.prod(1.0 + market_excess) ** (1.0 / n) - 1.0)
+        market_excess = (
+            market - risk_free
+        )
 
-        # (strat_std * sqrt(TRADING_DAYS) * 100) / (market_std * ...) reduces
-        # to strat_std / market_std - the scaling cancels.
-        vol_ratio = float(strat_std / market_std)
-        vol_penalty = 1.0 + max(0.0, vol_ratio - vol_ceiling)
+        strategy_growth = float(
+            np.prod(
+                1.0 + strategy_excess
+            )
+        )
 
-        return_gap_pct = max(0.0, (market_mean_excess - strat_mean_excess) * 100.0 * TRADING_DAYS)
-        ret_penalty = 1.0 + (return_gap_pct ** 2) / 100.0
+        market_growth = float(
+            np.prod(
+                1.0 + market_excess
+            )
+        )
 
-        score = min(base / (vol_penalty * ret_penalty), 1_000_000.0)
+        # Values <= 0 make the geometric return undefined.
+        if (
+            strategy_growth <= 0
+            or market_growth <= 0
+            or not np.isfinite(strategy_growth)
+            or not np.isfinite(market_growth)
+        ):
+            score = float(
+                _DEGENERATE_SCORE
+            )
+
+            raw_sharpe = 0.0
+
+            vol_ratio = float("nan")
+            vol_penalty = float("nan")
+            return_penalty = float("nan")
+
+        else:
+            strategy_mean_excess = float(
+                strategy_growth ** (1.0 / n_rows)
+                - 1.0
+            )
+
+            market_mean_excess = float(
+                market_growth ** (1.0 / n_rows)
+                - 1.0
+            )
+
+            raw_sharpe = float(
+                strategy_mean_excess
+                / strategy_std
+                * np.sqrt(TRADING_DAYS)
+            )
+
+            # Annualisation cancels when computing the ratio.
+            vol_ratio = float(
+                strategy_std / market_std
+            )
+
+            vol_penalty = float(
+                1.0
+                + max(
+                    0.0,
+                    vol_ratio - vol_ceiling,
+                )
+            )
+
+            return_gap_pct = float(
+                max(
+                    0.0,
+                    (
+                        market_mean_excess
+                        - strategy_mean_excess
+                    )
+                    * 100.0
+                    * TRADING_DAYS,
+                )
+            )
+
+            return_penalty = float(
+                1.0
+                + return_gap_pct**2 / 100.0
+            )
+
+            score = float(
+                min(
+                    raw_sharpe
+                    / (
+                        vol_penalty
+                        * return_penalty
+                    ),
+                    1_000_000.0,
+                )
+            )
 
     if not return_components:
         return float(score)
-    return {
-        "modified_sharpe": float(score),
-        "sharpe": float(base),
-        "vol_ratio": vol_ratio,
-        "vol_penalty": float(vol_penalty),
-        "return_penalty": float(ret_penalty),
-    }
+
+    return ModifiedSharpeComponents(
+        modified_sharpe=float(score),
+        sharpe=float(raw_sharpe),
+        vol_ratio=float(vol_ratio),
+        vol_penalty=float(vol_penalty),
+        return_penalty=float(return_penalty),
+    )
 
 
-def _official_metric():
-    """Return the organisers' ``score`` function if it is importable."""
+# --------------------------------------------------------------------------
+# Optional official Kaggle scorer
+# --------------------------------------------------------------------------
+
+
+def _official_metric() -> Any | None:
+    """Return the official Kaggle score function when available."""
     try:
-        from metric import score  # type: ignore  # noqa: WPS433
+        from metric import score  # type: ignore[import-not-found]
 
         return score
-    except Exception:  # pragma: no cover - depends on the runtime
+
+    except Exception:
         return None
 
 
@@ -199,20 +587,55 @@ def hull_score(
     risk_free_rate: np.ndarray,
     prefer_official: bool = True,
 ) -> float:
-    """Competition score, preferring the official implementation when present."""
+    """
+    Return the competition score.
+
+    If Kaggle's official `metric.py` is available, use it. Otherwise use
+    the local verified implementation.
+    """
     if prefer_official:
         official = _official_metric()
+
         if official is not None:
             solution = pd.DataFrame(
-                {"forward_returns": forward_returns, "risk_free_rate": risk_free_rate}
+                {
+                    "forward_returns": np.asarray(
+                        forward_returns,
+                        dtype=float,
+                    ),
+                    "risk_free_rate": np.asarray(
+                        risk_free_rate,
+                        dtype=float,
+                    ),
+                }
             )
-            submission = pd.DataFrame({"prediction": np.asarray(weights, float)})
-            return float(official(solution, submission, ""))
-    return float(modified_sharpe(weights, forward_returns, risk_free_rate))
+
+            submission = pd.DataFrame(
+                {
+                    "prediction": np.asarray(
+                        weights,
+                        dtype=float,
+                    )
+                }
+            )
+
+            return float(
+                official(
+                    solution,
+                    submission,
+                    "",
+                )
+            )
+
+    return modified_sharpe(
+        weights,
+        forward_returns,
+        risk_free_rate,
+    )
 
 
 # --------------------------------------------------------------------------
-# One-call evaluation
+# Complete evaluation
 # --------------------------------------------------------------------------
 
 
@@ -223,52 +646,168 @@ def evaluate(
     forward_returns: np.ndarray | None = None,
     risk_free_rate: np.ndarray | None = None,
 ) -> dict[str, Any]:
-    """Compute every metric this project reports, as a flat dict.
-
-    Pass ``weights`` + ``forward_returns`` + ``risk_free_rate`` to add the
-    strategy block; omit them for a prediction-only evaluation.
     """
-    out: dict[str, Any] = {
-        "rmse": rmse(y_true, y_pred),
-        "r2": r2(y_true, y_pred),
-        "spearman_ic": spearman_ic(y_true, y_pred),
-        "hit_rate": hit_rate(y_true, y_pred),
-        "n_rows": int(len(y_true)),
-    }
-    if weights is None or forward_returns is None or risk_free_rate is None:
-        return out
+    Calculate all prediction and optional strategy metrics.
 
-    strat = strategy_returns(weights, forward_returns, risk_free_rate)
-    rf = np.asarray(risk_free_rate, float)
-    market = np.asarray(forward_returns, float)
-    components = modified_sharpe(
-        weights, forward_returns, risk_free_rate, return_components=True
+    Regression metrics MUST receive the raw regression prediction.
+
+    Do not pass the standardised trading signal as `y_pred`.
+    """
+    true = np.asarray(
+        y_true,
+        dtype=float,
     )
-    out.update(components)
-    out.update(
+
+    prediction = np.asarray(
+        y_pred,
+        dtype=float,
+    )
+
+    output: dict[str, Any] = {
+        "rmse": rmse(
+            true,
+            prediction,
+        ),
+        "r2": r2(
+            true,
+            prediction,
+        ),
+        "spearman_ic": spearman_ic(
+            true,
+            prediction,
+        ),
+        "hit_rate": hit_rate(
+            true,
+            prediction,
+        ),
+        "n_rows": int(
+            len(true)
+        ),
+    }
+
+    if (
+        weights is None
+        or forward_returns is None
+        or risk_free_rate is None
+    ):
+        return output
+
+    allocation = np.asarray(
+        weights,
+        dtype=float,
+    )
+
+    market = np.asarray(
+        forward_returns,
+        dtype=float,
+    )
+
+    risk_free = np.asarray(
+        risk_free_rate,
+        dtype=float,
+    )
+
+    strategy = strategy_returns(
+        allocation,
+        market,
+        risk_free,
+    )
+
+    components = modified_sharpe(
+        allocation,
+        market,
+        risk_free,
+        return_components=True,
+    )
+
+    output.update(
+        components
+    )
+
+    output.update(
         {
-            "ann_return": float(np.mean(strat) * TRADING_DAYS),
-            "ann_volatility": annualised_volatility(strat),
-            "max_drawdown": max_drawdown(strat),
-            "benchmark_sharpe": sharpe(market - rf),
-            "mean_weight": float(np.mean(weights)),
-            "weight_turnover": float(np.mean(np.abs(np.diff(np.asarray(weights, float))))),
+            "ann_return": float(
+                np.mean(strategy)
+                * TRADING_DAYS
+            ),
+            "ann_volatility": annualised_volatility(
+                strategy
+            ),
+            "cumulative_return": cumulative_return(
+                strategy
+            ),
+            "max_drawdown": max_drawdown(
+                strategy
+            ),
+            "benchmark_sharpe": sharpe(
+                market - risk_free
+            ),
+            "mean_weight": float(
+                np.mean(allocation)
+            ),
+            "weight_turnover": float(
+                np.mean(
+                    np.abs(
+                        np.diff(allocation)
+                    )
+                )
+            )
+            if len(allocation) > 1
+            else 0.0,
         }
     )
-    return out
+
+    return output
 
 
-def aggregate_folds(fold_metrics: list[dict[str, Any]]) -> dict[str, Any]:
-    """Mean and std of each numeric metric across folds.
+# --------------------------------------------------------------------------
+# Fold aggregation
+# --------------------------------------------------------------------------
 
-    Report ``<metric>_mean`` as the headline and ``<metric>_std`` as the
-    stability measure - on this dataset, fold variance is large enough that a
-    mean alone is misleading.
+
+def aggregate_folds(
+    fold_metrics: list[dict[str, Any]],
+) -> dict[str, Any]:
     """
-    frame = pd.DataFrame(fold_metrics)
-    out: dict[str, Any] = {"n_folds": len(fold_metrics)}
-    for col in frame.columns:
-        if pd.api.types.is_numeric_dtype(frame[col]):
-            out[f"{col}_mean"] = float(frame[col].mean())
-            out[f"{col}_std"] = float(frame[col].std(ddof=0))
-    return out
+    Aggregate fold-level metrics.
+
+    Both mean and standard deviation are reported because financial
+    time-series performance can vary strongly across market regimes.
+    """
+    if not fold_metrics:
+        return {
+            "n_folds": 0
+        }
+
+    frame = pd.DataFrame(
+        fold_metrics
+    )
+
+    output: dict[str, Any] = {
+        "n_folds": int(
+            len(fold_metrics)
+        )
+    }
+
+    for column in frame.columns:
+        if not pd.api.types.is_numeric_dtype(
+            frame[column]
+        ):
+            continue
+
+        values = pd.to_numeric(
+            frame[column],
+            errors="coerce",
+        )
+
+        output[f"{column}_mean"] = float(
+            values.mean()
+        )
+
+        output[f"{column}_std"] = float(
+            values.std(
+                ddof=0
+            )
+        )
+
+    return output

@@ -22,6 +22,8 @@ from .allocation import (
     causal_standardise,
     naive_allocation,
     realised_vol,
+    risk_controlled_vol_budget_allocation,
+    calibrate_vol_budget_scale,
     smooth_weights,
     vol_budget_allocation,
     vol_target_allocation,
@@ -60,6 +62,11 @@ from .features import (
     build_features,
     inverse_vol_weights,
     top_features_by_gain,
+)
+from .preprocessing import (
+    ForwardMedianImputer,
+    apply_standardization,
+    standardization_stats,
 )
 from .metrics import (
     aggregate_folds,
@@ -131,6 +138,9 @@ __all__ = [
     "modified_sharpe",
     "hull_score",
     "strategy_returns",
+    "ForwardMedianImputer",
+    "standardization_stats",
+    "apply_standardization",
     "naive_allocation",
     "binary_allocation",
     "vol_target_allocation",
@@ -139,6 +149,8 @@ __all__ = [
     "causal_standardise",
     "smooth_weights",
     "realised_vol",
+    "risk_controlled_vol_budget_allocation",
+    "calibrate_vol_budget_scale",
     "save_result",
     "load_results",
     "compare",
