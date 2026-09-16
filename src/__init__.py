@@ -23,6 +23,7 @@ from .allocation import (
     naive_allocation,
     realised_vol,
     smooth_weights,
+    ternary_allocation,
     vol_budget_allocation,
     vol_target_allocation,
 )
@@ -133,6 +134,7 @@ __all__ = [
     "strategy_returns",
     "naive_allocation",
     "binary_allocation",
+    "ternary_allocation",
     "vol_target_allocation",
     "vol_budget_allocation",
     "calibrate_k",

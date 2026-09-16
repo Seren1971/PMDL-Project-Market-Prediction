@@ -11,6 +11,10 @@ Attribution
   Stage 3, in the spirit of the 100th place write-up's metric-anchored sizing.
 * :func:`binary_allocation` - the 61st place policy: risk-free or fully
   invested, nothing in between, as a form of regularisation.
+* :func:`ternary_allocation` - a three-state extension of the binary rule
+  (risk-free / passive / leveraged) for a signal with a clear neutral band,
+  giving the discrete-policy family a middle ground without fitting a
+  continuous size.
 * :func:`vol_target_allocation` - the 4th place volatility-targeting overlay,
   which that author credits with more leaderboard gain than the alpha itself.
 * :func:`vol_budget_allocation` - a 100th-place-style refinement of the naive
@@ -44,6 +48,25 @@ def naive_allocation(prediction: np.ndarray, k: float = 1.0) -> np.ndarray:
 def binary_allocation(prediction: np.ndarray, threshold: float = 0.0) -> np.ndarray:
     """Fully invested when the signal clears ``threshold``, risk-free otherwise."""
     return (np.asarray(prediction, float) > threshold).astype(float)
+
+
+def ternary_allocation(
+    prediction: np.ndarray, threshold: float = 0.0, leveraged: float = 2.0
+) -> np.ndarray:
+    """Risk-free (0), passive (1), or ``leveraged`` (default 2) fully-invested.
+
+    A symmetric extension of :func:`binary_allocation`: a signal that clears
+    ``+threshold`` gets leveraged exposure, one below ``-threshold`` sits out
+    entirely, and anything in the neutral band between the two just holds the
+    passive ``w = 1`` benchmark rather than being forced to pick a side. Still
+    two hyperparameters at most (``threshold``, ``leveraged``), so it keeps the
+    discrete family's regularising property while adding one state.
+    """
+    p = np.asarray(prediction, float)
+    out = np.ones_like(p)
+    out[p > threshold] = leveraged
+    out[p < -threshold] = 0.0
+    return out
 
 
 def vol_target_allocation(

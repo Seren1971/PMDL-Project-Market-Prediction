@@ -1,9 +1,9 @@
 """
-Result persistence and cross-model comparison.
+Result persistence and cross-model comparison
 
 Every notebook ends with one :func:`save_result` call. The shared CSV is what
 makes the four-way comparison (baselines / proposed / improved) possible without
-re-running anything.
+re-running anything
 """
 
 import json
@@ -18,7 +18,7 @@ from .config import ARTIFACT_DIR, RESULTS_DIR
 
 LEADERBOARD = "leaderboard.csv"
 
-#: Columns shown first by :func:`compare`.
+#: Columns shown first by :func:`compare`
 HEADLINE = [
     "model",
     "stage",
@@ -40,18 +40,18 @@ def save_result(
     params: dict[str, Any] | None = None,
     results_dir: Path | None = None,
 ) -> Path:
-    """Append one row to ``results/leaderboard.csv``.
+    """Append one row to ``results/leaderboard.csv``
 
     Parameters
     ----------
     model : short identifier, e.g. ``"lgbm_61st"``. Re-running a notebook with
-        the same ``model`` + ``split`` replaces the previous row.
-    stage : one of ``"baseline"``, ``"proposed"``, ``"improved"``.
+        the same ``model`` + ``split`` replaces the previous row
+    stage : one of ``"baseline"``, ``"proposed"``, ``"improved"``
     metrics : output of :func:`src.metrics.aggregate_folds` or
-        :func:`src.metrics.evaluate`.
+        :func:`src.metrics.evaluate`
     split : ``"cv"`` for cross-validated results, ``"public"`` for the held-out
-        180-day block.
-    params : hyperparameters, stored as a JSON string for the record.
+        180-day block
+    params : hyperparameters, stored as a JSON string for the record
     """
     directory = Path(results_dir or RESULTS_DIR)
     directory.mkdir(parents=True, exist_ok=True)
@@ -85,30 +85,63 @@ def load_results(results_dir: Path | None = None) -> pd.DataFrame:
 
 
 def compare(
-    split: str = "cv", results_dir: Path | None = None, columns: list[str] | None = None
+    split: str = "cv",
+    results_dir: Path | None = None,
+    columns: list[str] | None = None,
+    show_mean_cols: bool = False,
 ) -> pd.DataFrame:
-    """Comparison table of all recorded models, best Spearman IC first."""
+    """Comparison table of all recorded models, best Spearman IC first"""
     frame = load_results(results_dir)
     if frame.empty:
         return frame
-    frame = frame.loc[frame["split"] == split]
-    # Cross-validated rows carry "<metric>_mean" names, single-split rows the
-    # bare metric name; accept either so both appear in one table.
-    candidates = [c for h in HEADLINE for c in (h, h.replace("_mean", ""))]
-    cols = columns or list(dict.fromkeys(c for c in candidates if c in frame.columns))
-    sort_key = (
-        *(k for k in ("modified_sharpe_mean", "modified_sharpe") if k in frame.columns),
-        *(k for k in ("spearman_ic_mean", "spearman_ic") if k in frame.columns), 
-        cols[0]
-    )
-    return frame[cols].sort_values(by=sort_key, ascending=False).reset_index(drop=True)
 
+    frame = frame.loc[frame["split"] == split]
+
+    # Cross-validated rows carry "<metric>_mean" names, single-split rows
+    # the bare metric name; accept either so both appear in one table.
+    candidates = [
+        c
+        for h in HEADLINE
+        for c in (h, h.replace("_mean", ""))
+    ]
+
+    cols = columns or list(dict.fromkeys(
+        c for c in candidates if c in frame.columns
+    ))
+
+    cols = list(dict.fromkeys(c for c in cols if c in frame.columns))
+
+    # Drop columns that contain only NaNs
+    cols = [c for c in cols if frame[c].notna().any()]
+
+    if not cols:
+        return frame.iloc[0:0].copy()
+
+    sort_key = [
+        c for c in (
+            "modified_sharpe_mean",
+            "modified_sharpe",
+            "spearman_ic_mean",
+            "spearman_ic",
+        )
+        if c in cols
+    ]
+
+    # Fallback so sort_values always has something to sort by
+    if not sort_key:
+        sort_key = [cols[0]]
+
+    return (
+        frame[cols]
+        .sort_values(by=sort_key, ascending=False)
+        .reset_index(drop=True)
+    )
 
 def save_predictions(
     name: str, date_id, y_true, y_pred, weights=None, results_dir: Path | None = None
 ) -> Path:
     """Persist per-row predictions so later notebooks can blend or re-score
-    without refitting."""
+    without refitting"""
     directory = Path(results_dir or ARTIFACT_DIR)
     directory.mkdir(parents=True, exist_ok=True)
     frame = pd.DataFrame(
