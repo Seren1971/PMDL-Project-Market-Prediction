@@ -88,7 +88,6 @@ def compare(
     split: str = "cv",
     results_dir: Path | None = None,
     columns: list[str] | None = None,
-    show_mean_cols: bool = False,
 ) -> pd.DataFrame:
     """Comparison table of all recorded models, best Spearman IC first"""
     frame = load_results(results_dir)
