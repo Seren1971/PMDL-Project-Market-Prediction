@@ -1,9 +1,8 @@
 """
 Purged / embargoed time-series cross-validation.
 
-Every notebook in this project must call :func:`get_folds` with the default
-settings so that baseline, proposed and improved models are compared on
-mathematically identical folds.
+The proposed and improved pipelines share the default outer folds. Baseline
+notebooks keep their source splitters and have public-only saved evaluations.
 
 Concept
 -------
