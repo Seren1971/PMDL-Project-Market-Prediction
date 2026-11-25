@@ -1,0 +1,458 @@
+Hull Tactical Market Prediction
+
+Predicting S&P 500 excess returns and sizing a daily allocation under a volatility constraint
+
+Technical report — PMLDL 2026 project, Stage 2 (Project implementation)
+
+Topic 22: Market Prediction · anonymized submission
+
+Summary
+
+We study Hull Tactical Market Prediction: each trading day a model outputs an S&P 500 allocation in [0, 2], scored by volatility- and shortfall-penalised modified Sharpe. We reproduce three public baselines, evaluate a hybrid LightGBM with domain indicators, and extend it with a LightGBM/CatBoost/Ridge ensemble and allocation selection. The revised study nests selection inside chronological training periods and compares every evaluated strategy with passive w=1. The label improved names a pipeline stage; it does not establish a statistically reliable performance gain.
+
+Model | Nested outer modified Sharpe (mean ± SD) | Public diagnostic modified Sharpe
+Buy-and-hold (w=1) | 0.4159 ± 0.4511 | 1.1263
+Proposed hybrid LightGBM | 0.4480 ± 0.4347 | 1.2036
+Improved selection procedure | 0.4933 ± 0.4502 | 1.1907
+B2 public baseline | Not evaluated | 0.6172
+
+Table 0. Headline results. All numbers are from results/leaderboard.csv and the notebooks; the buy-and-hold row is computed by report_analysis.py.
+
+Revised findings. Nested outer modified Sharpe: proposed 0.4480 ± 0.4347, improved 0.4933 ± 0.4502, passive 0.4159 ± 0.4511. The improved-minus-passive mean difference is +0.0774; no superiority is assumed from the model name. Public scores are retrospective diagnostics. Historical tuning-fold scores 0.453 and 0.770 are retained only as development history.
+
+
+
+
+
+
+1. Problem statement
+
+1.1 Task
+
+For every trading day t the model receives anonymised market features and must return a weight wₜ ∈ [0, 2] for holding the S&P 500 (0 = everything at the risk-free rate, 1 = fully invested, 2 = 2× leverage financed at the risk-free rate). The daily strategy return is rₜ = wₜ · forward_returnₜ + (1 − wₜ) · risk_free_rateₜ. The task therefore has two parts: a forecasting part (predict the next-day excess return) and a decision part (turn the forecast into a position that keeps volatility close to the market's). The competition frames this as a test of the Efficient Market Hypothesis: a strategy should outperform the index without taking more than 120% of its volatility.
+
+The last 180 date_ids are excluded from model fitting and form the public diagnostic. They are not an untouched test: the historical score of 0.011 influenced development (§4.5). No new prospective test data are available; the forecasting phase is out of scope.
+
+1.2 Data source and preprocessing
+
+Data: train.csv from the competition page (https://www.kaggle.com/competitions/hull-tactical-market-prediction/data). It has 9,048 rows (date_id 0–9047) and 94 anonymised daily features grouped by prefix: M (market dynamics), E (macro), I (interest rates), P (price/valuation), V (volatility), S (sentiment), D (binary dummies). Three columns describe the future relative to their row and are used only as labels or for scoring: forward_returns, risk_free_rate and the target market_forward_excess_returns (forward return minus its 5-year rolling mean, MAD-winsorised by the organisers).
+
+Step | What is done (code) | Effect
+Coverage trim | Drop leading rows where < 50% of the 94 features are non-null (src/data.py: load_dataset) | Removes date_id 0–1005; 9,048 → 8,042 rows
+Hold-out split | Last 180 date_ids become the public block; nothing is fitted on them | Train 7,862 rows (date_id 1006–8867); public 180 rows (8868–9047)
+Causal returns | Price-derived features use past_returns() = forward_returns.shift(1); assertions check the lag and that no look-ahead column is in the feature list | Prevents look-ahead leakage
+Imputation | Forward-fill and training-fold median, recomputed inside every inner/outer model fit | 72 of 94 features have no missing values after the trim; worst: E7 74%, V10 63%, S3 59%, M1/M13/M14 56%, M6 50%
+
+Table 1. Data pipeline shared by the proposed and improved models. The baselines keep their original preprocessing (§2.2).
+
+Recomputed data checks (data_checks.py): 9048 raw rows, 8042 usable rows, 7862 development and 180 public rows; 72 fully observed raw features after trimming. Target mean=6.98147e-05, SD=0.0108391. Forward-return excess kurtosis=2.081, Jarque–Bera p=0, lag-1 autocorrelation=-0.0511, squared-return lag-1 autocorrelation=0.2648. Unique dates, chronological splitting, the causal return lag and purged boundaries are checked programmatically. These internal checks alone do not prove real-market provenance or reconstruct anonymous calendar dates; no external reference-return match is claimed.
+
+1.3 Evaluation metrics
+
+Primary metric — modified Sharpe (src/metrics.py: modified_sharpe), a re-implementation of the organisers' public scoring function (https://www.kaggle.com/code/metric/hull-competition-sharpe). Let s be the strategy returns and m the market returns on the scored rows:
+
+Sharpe = geometric-mean daily excess return of s / std(s) × √252;
+
+vol_penalty = 1 + max(0, std(s)/std(m) − 1.2) — volatility up to 120% of the market is free;
+
+return_penalty = 1 + gap² / 100, where gap is the annualised shortfall (in %) of the strategy's geometric mean excess return below the market's;
+
+modified Sharpe = Sharpe / (vol_penalty × return_penalty). Higher is better.
+
+The implementation follows the official formula (divisor penalties, geometric mean, std of raw returns). Unlike the official code it does not raise on degenerate inputs (zero variance or weights outside [0, 2]); it returns a very low score instead, so that searches do not crash. No reported model has weights outside [0, 2] (bounds_violation = 0 for all rows).
+
+Metric | Definition | Better | Why reported
+Spearman IC | Rank correlation of prediction and target | higher | Main model-tuning objective: ranking good vs bad days is learnable, magnitudes are not
+RMSE, R² | Regression error / fit | lower / higher | Diagnostics only; not comparable across baselines (§2.4)
+Hit rate | Share of days with sign(prediction) = sign(target) | higher | Coarse directional accuracy
+Sharpe | Unpenalised annualised Sharpe of the strategy | higher | Separates return quality from penalties
+Vol ratio, penalties | std(s)/std(m); the two divisors above | vol ratio ≤ 1.2; penalties = 1 | Explains why a score is low
+Ann. return, ann. volatility, max drawdown | Strategy profile | context | Risk profile
+Mean weight, turnover | Average position; mean |Δw| per day | context | Exposure; proxy for trading costs
+
+Table 2. Secondary metrics (src/metrics.py: evaluate).
+
+1.4 Validation protocol
+
+The revised evaluation separates selection from scoring chronologically. Baselines have public-only comparisons with their original internal splitters. Proposed, improved and passive strategies additionally use the same four outer evaluation folds.
+
+Public diagnostic (180 days). The pipeline is selected on preceding training rows and refitted before scoring this period. Because the block influenced historical development, its results cannot be treated as independent test evidence.
+
+Nested purged temporal CV. For each outer fold, three inner temporal folds select model parameters, ensemble and allocation using only the outer training rows. Imputation is fitted inside each fit. Outer labels never control early stopping; iteration counts are selected internally and fixed before outer scoring. Purge=1 and the validation-head gap=20 are applied at both levels. This retrospective protocol removes within-run selection reuse but cannot erase earlier human exposure to the dataset.
+
+Fold | Train rows | Validation rows | Train ends (date_id) | Validation (date_id)
+0 | 1,571 | 1,552 | 2576 | 2598–4149
+1 | 3,143 | 1,552 | 4148 | 4170–5721
+2 | 4,715 | 1,552 | 5720 | 5742–7293
+3 | 6,287 | 1,554 | 7292 | 7314–8867
+
+Table 3. Cross-validation folds (identical in the proposed and improved notebooks).
+
+Reference strategy. Buy-and-hold (w=1) is scored using the same modified Sharpe: 0.4159 ± 0.4511 on outer folds and 1.1263 publicly. The separate benchmark_sharpe diagnostic is arithmetic Sharpe and is not this reference score.
+
+2. Baselines
+
+2.1 Choice of existing solutions
+
+The competition ended before the project started, so we selected baselines from publicly available material:
+
+The code of the top leaderboard solutions is not public. The 4th-place solution is available only as a write-up without code (baselines/04_4th_writeup.md), and it is explicitly not an ML solution (rule-based mean-reversion signal plus portfolio construction). We use it as a source of ideas, not as a baseline.
+
+Many public notebooks report very high public-leaderboard scores (≈17). Because the public test set is a copy of the last 180 training rows, these scores come from fitting the answers and are not meaningful; the best private-leaderboard scores are much lower. Such notebooks were rejected.
+
+The three source baselines represent a linear allocation model, a single LightGBM with temporal features, and an ElasticNet/XGBoost/LightGBM ensemble. B3 executes as a frozen ensemble in our replay; the online procedure advertised by the source does not run.
+
+2.2 Adaptation protocol
+
+The modelling logic of each notebook is kept as in the source. Changes are limited to data loading and result saving, and every change is marked in the notebook with an ADDED (PMLDL Stage 1) comment:
+
+hard-coded /kaggle/input paths are replaced by the shared loader src.load_dataset();
+
+the last 180 date_ids are removed from training (the original notebooks trained on them);
+
+the Kaggle evaluation server is replaced by an offline replay that feeds the public block to the notebook's predict() one row at a time, rebuilding the lagged_* columns the API would provide;
+
+scoring goes through src.metrics and results are written to results/leaderboard.csv.
+
+Baselines retain their source preprocessing and internal validation. The B2 model and B3 hyperparameters can be restored from the submitted archive; replaying those artifacts reproduces their historical scores. New seeded searches are distinct experiments and are not guaranteed to recover parameters from the original unseeded searches. No baseline outer CV score is reported.
+
+2.3 Description
+
+ID / notebook | Source | Method | Key configuration (as in source)
+B1 elasticnet_leak_safebaselines/01_simple_baselines.ipynb | Leak-safe baseline notebook (morodertobias/hull-leak-safe-baseline), which follows the Hull starter notebook | ElasticNet regressing an analytically derived "optimal allocation" target (clipped to [0, 2]) instead of the excess return | 13 features (S2, E2, E3, P8, P9, P10, P12, P13, S1, S5, I2, U1, U2); l1_ratio = 0.5; alpha by ElasticNetCV over 100 values in [10⁻⁴, 10²], 10-fold; selected alpha = 0.0087
+B2 lgbm_61stbaselines/02_strong_baseline_61st.ipynb | 61st place notebook (rafanikitas/hull-eda-training-pipeline) | Single LightGBM on lag / rolling features; discrete 0/1/2 signal | 14 columns (M4, V13, S5, S2, D2, E19, P7, P6, P3, P13, P4, P5, M2, V5) × lags 1,3,5,7,14,20 and rolling mean/std 2,5,10,20,60; Optuna 200 trials (90-min timeout), objective mean Spearman over sklearn TimeSeriesSplit(4); best IC 0.069; best: 4,468 trees, lr 0.022, depth 6, 690 leaves
+B3 online_ensemble_100thbaselines/03_strong_baseline_100th.ipynb | 100th place notebook (tingkaigong/hull-market-prediction-just-improved) | Frozen ElasticNet + XGBoost + LightGBM, weights 0.30/0.35/0.35; volatility-scaled smoothed allocation | Top-50 features; offline fit and optional cached parameters. The intended 800-row updates / 50-row retuning do not execute: create_features removes the lagged target before previous_lagged is stored. New searches use seeded samplers.
+
+Table 4. Baselines. Full URLs are listed in the References.
+
+2.4 Baseline results
+
+Model | Spearman IC | Hit rate | Mod. Sharpe | Sharpe | Vol ratio | Return penalty | Ann. return | Mean weight
+B1 ElasticNet | -0.1359 | 0.5500 | 0.3876 | 1.3857 | 0.1049 | 3.5753 | 0.0645 | 0.1210
+B2 LightGBM (61st) | 0.0717 | 0.2611 | 0.6172 | 0.9215 | 0.7564 | 1.4931 | 0.1623 | 0.4500
+B3 Frozen ensemble (100th) | 0.0001 | 0.5500 | 0.0848 | 0.2998 | 0.5089 | 3.5374 | 0.0690 | 0.2189
+Buy-and-hold (w=1) | — | — | 1.1263 | 1.1263 | 1.0000 | 1.0000 | 0.2382 | 1.0000
+
+Table 5. Baselines on the public block (180 days). RMSE is omitted here, see the note below.
+
+Analysis. All three baselines score below buy-and-hold. The dominant reason is the return penalty: on our data they are strongly under-invested (mean weight 0.12–0.45) during a rising market (buy-and-hold earned 23.8% annualised on this block), so their low volatility does not compensate for the missed return. B1 has a decent unpenalised Sharpe (1.39) but keeps only ~12% of capital in the market. B2 is the best baseline and is used as the base of our proposed model.
+
+Why RMSE and hit rate are not compared across baselines. For B1–B3 the saved "prediction" is the allocation itself (B1 predicts an allocation target; B2 and B3 output positions), so RMSE against the excess-return target is meaningless (0.12–0.67) and the hit rate is distorted (B2's signal is often exactly 0). In B2 the quantile threshold of the discrete rule is computed on a single prediction during row-wise inference, so the rule effectively becomes 0/1 by sign; we kept this behaviour because it is part of the source code. Spearman IC and the Sharpe-family metrics are comparable across all models.
+
+3. Proposed model
+
+
+
+Figure 1. Replayed baseline allocations on the public diagnostic, with the passive w=1 reference. B3 is a frozen ensemble; no online refitting occurs.
+
+3.1 Idea
+
+The 4th-place write-up shows that short-horizon mean-reversion signals combined with volatility-aware weighting work without any learning, but its author names the fixed weighting as the limitation: reversion pays in choppy markets and loses in trends. A gradient-boosting model can, in principle, learn when such signals matter. The 61st-place pipeline was chosen as the learner because it already tunes on rank correlation rather than RMSE. The proposed model (proposed_model/proposed_hybrid_model.ipynb, name hybrid_domain_lgbm) is therefore a single LightGBM trained on the 61st-place temporal features plus a new block of domain features. The code is written from scratch in src/; only the class of indicators and the pipeline design are borrowed (attributed in the notebook header).
+
+3.2 Features
+
+Block | Features | Count | Origin
+A. Domain signals (src/features.py: add_price_features) | ret_1d; momentum over 5/10/20/60 days; realised volatility over 5/20/60 days (annualised); vol_5 − vol_60, ratios 5/60 and 20/60; mean-reversion z-scores over 3/5/10 days (recent mean return / 20-day volatility, sign-flipped); 20-day drawdown. All computed from past_returns() | 15 | Idea: 4th place write-up
+B. Cross terms | U1 = I2 − I1, U2 = M11 / mean(I2, I9, I7) | 2 | Hull starter notebook; also used by B1 and B3
+C. Temporal context | Lags 1/3/5/7/14/20 and rolling mean/std 2/5/10/20/60 of the same 14 columns as B2 (kept identical so the comparison isolates block A) | 224 | 61st place notebook
+Raw features | Remaining original columns | 94 | Competition data
+
+Table 6. Feature set of the proposed model: 335 features in total. Features are built on the full chronological frame so rolling windows are continuous at the train/public boundary; all windows look strictly backwards.
+
+3.3 Model and training procedure
+
+Model: LGBMRegressor (regression objective), target market_forward_excess_returns.
+
+Nested model search: seeded Optuna TPE, 8 trials per family per selection on 3 inner purged temporal folds, at most 300 trees. The objective is mean inner Spearman IC. Budgets are fixed trial counts, with no wall-clock cutoff. These revised experiments differ from the original 120-trial search.
+
+Each outer evaluation refits on its own earlier training rows using inner-selected parameters. The public diagnostic uses a fresh selection on the full development period followed by refitting.
+
+Allocation: naive linear rule w = clip(1 + k · prediction, 0, 2) with a fixed k = 50. It stays centred on buy-and-hold and keeps the magnitude of the prediction, unlike B2's discrete rule. k was fixed, not tuned; selecting the allocation rule is deferred to the improvement stage.
+
+Determinism: seed=42, LightGBM deterministic=True and force_col_wise=True; CPU thread budget=2. Versions and all selected parameters are in manifest.json.
+
+Parameter | Revised search range | Selected for public diagnostic
+learning_rate | 0.01–0.07 log | 0.065977
+subsample | 0.6–1.0 | 0.91005
+n_estimators | 60–300 | 104
+num_leaves | 16–64 | 62
+max_depth | 4–8 | 8
+colsample_bytree | 0.6–1.0 | 0.83916
+reg_lambda | 0.001–10 log | 4.8696
+
+Table 7. Revised search space and inner-selected LightGBM parameters for the public diagnostic; outer-fold selections are recorded separately in manifest.json.
+
+3.4 Results of the proposed model
+
+Fold | Spearman IC | RMSE | Hit rate | Mod. Sharpe | Passive mod. Sharpe | Vol ratio | Mean weight
+0 | 0.0537 | 0.0114 | 0.5206 | -0.1607 | -0.2413 | 1.0647 | 0.9975
+1 | 0.0240 | 0.0133 | 0.4845 | 0.2415 | 0.2518 | 1.1170 | 1.0235
+2 | -0.0001 | 0.0079 | 0.4826 | 0.9272 | 0.9215 | 1.0189 | 0.9833
+3 | 0.0529 | 0.0113 | 0.5077 | 0.7840 | 0.7316 | 1.0925 | 0.9905
+
+Table 8. Proposed model, cross-validation (the per-fold modified Sharpe was re-computed from the saved out-of-fold weights and matches the notebook).
+
+Model | Spearman IC | RMSE | Hit rate | Mod. Sharpe | Sharpe | Vol ratio | Ann. return | Max DD | Turnover
+passive | 0.0000 | 0.0103 | 0.0000 | 1.1263 | 1.1263 | 1.0000 | 0.2382 | -0.1297 | 0.0000
+proposed | 0.1052 | 0.0103 | 0.5111 | 1.2036 | 1.2036 | 1.0803 | 0.2689 | -0.1293 | 0.0626
+improved | 0.1648 | 0.0103 | 0.4889 | 1.1907 | 1.1907 | 1.0266 | 0.2547 | -0.1087 | 0.1303
+
+Table 9. Proposed model vs. the best baseline and buy-and-hold on the public block (n/c = not comparable, §2.4).
+
+Ablation. Across 20 paired fit seeds (0–19), the mean domain-block IC gain is -0.00167 (sample SD 0.01002), positive in 10 runs; paired t=-0.747, p=0.4642. Parameters are fixed within each outer fold. This measures fit-seed sensitivity, not 20 independent datasets or repeated searches. The original single-seed +0.013 does not establish a stable contribution. Actual LightGBM gain gives the domain block 9.6% of outer-model gain. Split counts are not labelled gain. Importance describes model usage, not evidence that a feature improves unseen returns.
+
+Analysis. Revised public diagnostic modified Sharpe: proposed 1.2036 versus passive 1.1263. This direct comparison replaces the claim that beating the weaker baselines demonstrates outperformance of the index. Public selection history prevents an independent-test interpretation.
+
+Sensitivity to the allocation rule (reported for context, not used for selection). With the same public-block predictions, the binary rule (61st place) gives 1.803, volatility targeting 1.188 and naive 1.122. The binary rule looks best on this single block, but choosing it here would mean selecting on the test data. This observation motivated a proper, cross-validated rule search in the next stage.
+
+4. Model improvements
+
+Notebook: model_improvements/model_improvement.ipynb, name ensemble_lgbm_catboost_ridge. The feature set, data split and folds are identical to the proposed model, so differences come only from the model and allocation stages.
+
+4.1 Changes
+
+# | Change | Type | Motivation
+1 | LightGBM, CatBoost and standardised Ridge, tuned on inner folds | Model families | Different inductive biases
+2 | Average or inverse-volatility blend, selected by inner mean IC | Ensemble | Choice made before outer evaluation
+3 | Naive, binary, ternary and vol_target: 16 trials per rule; fixed passive alternative | Sizing | Select mean minus 0.25 SD of inner modified Sharpe
+4 | Fixed inner-selected tree counts; imputation inside every fit; no outer early stopping | Evaluation | Outer labels excluded from selection
+5 | Paired 20-seed domain ablation, explicit gain importance and paired block intervals | Reliability | Quantify fit randomness and temporal sampling limits separately
+
+Table 10. Changes from the proposed to the improved model.
+
+4.2 Hyperparameter search
+
+Component | Trials per selection | Search space | Public-diagnostic selection | Evaluation
+lgbm | 8 | See src/experiments.py | {"learning_rate": 0.06597722855040666, "subsample": 0.9100531293444458, "n_estimators": 104, "num_leaves": 62, "max_depth": 8, "colsample_bytree": 0.8391599915244341, "reg_lambda": 4.869640941520899} | Inner tuning only
+catboost | 8 | See src/experiments.py | {"learning_rate": 0.013118554631532425, "subsample": 0.7168578594140873, "iterations": 207, "depth": 5, "l2_leaf_reg": 0.23345864076016243} | Inner tuning only
+ridge | 8 | See src/experiments.py | {"alpha": 5061.576888752303} | Inner tuning only
+Allocation | 16 per rule | Four rules plus passive | {"name": "vol_target", "params": {"k": 488.2556212881167}} | Inner tuning only
+
+Table 11. Fixed revised search budgets and inner-selected public-diagnostic parameters. Inner tuning objectives are not outer evaluation scores; no outer early stopping is used.
+
+4.3 Effect on metrics
+
+Pipeline | Fold 0 IC | Fold 1 IC | Fold 2 IC | Fold 3 IC | Mean IC
+passive | 0.0000 | 0.0000 | 0.0000 | 0.0000 | 0.0000
+proposed | 0.0537 | 0.0240 | -0.0001 | 0.0529 | 0.0326
+improved | 0.0521 | 0.0371 | 0.0137 | 0.0687 | 0.0429
+
+Table 12. Nested outer Spearman IC for the two evaluated pipelines; the constant passive signal has no forecasting interpretation. Historical per-family selection scores are superseded.
+
+Rule | Fold 0 | Fold 1 | Fold 2 | Fold 3 | Mean ± sd | Score (mean − 0.25 sd) | Vol ratio | Mean weight | Public block
+naive | 0.145 | 0.242 | 0.924 | 0.898 | 0.552 ± 0.361 | 0.462 | 1.375 | 0.97 | 1.243
+binary | 0.340 | 0.628 | 0.821 | 1.233 | 0.756 ± 0.325 | 0.674 | 0.742 | 0.32 | 1.578
+ternary | 0.192 | 0.275 | 0.992 | 0.796 | 0.564 ± 0.339 | 0.479 | 1.406 | 1.04 | 1.295
+vol_target (selected) | 0.356 | 0.613 | 0.921 | 1.191 | 0.770 ± 0.314 | 0.692 | 1.051 | 0.83 | 1.239
+Buy-and-hold | −0.241 | 0.252 | 0.922 | 0.732 | 0.416 ± 0.451 | — | 1.000 | 1.00 | 1.126
+
+Table 13. HISTORICAL tuning-fold allocation comparison. These original numbers were used to select the rule and are optimistic. They are development diagnostics, not independent evidence. Revised outer results are in Tables 14 and 16.
+
+
+
+Figure 2. Recomputed feature missingness after coverage trimming (data_checks.py). The earlier allocation-search figure has been replaced; old rule scores remain historical in Table 13.
+
+Split | Model | Spearman IC | Mod. Sharpe | Sharpe | Vol ratio | Ann. return | Max DD | Mean weight | Turnover
+Nested outer | passive | 0.0000 ± 0.0000 | 0.4159 ± 0.4511 | 0.4159 ± 0.4511 | 1.0000 ± 0.0000 | 0.0962 ± 0.0624 | -0.3368 ± 0.1572 | 1.0000 ± 0.0000 | 0.0000 ± 0.0000
+Nested outer | proposed | 0.0326 ± 0.0224 | 0.4480 ± 0.4347 | 0.4480 ± 0.4347 | 1.0732 ± 0.0364 | 0.1092 ± 0.0645 | -0.3436 ± 0.1525 | 0.9987 ± 0.0152 | 0.0532 ± 0.0283
+Nested outer | improved | 0.0429 ± 0.0202 | 0.4933 ± 0.4502 | 0.5035 ± 0.4578 | 0.9440 ± 0.2078 | 0.1041 ± 0.0662 | -0.2615 ± 0.1336 | 0.8146 ± 0.3804 | 0.1059 ± 0.0273
+Public diagnostic | passive | 0.0000 | 1.1263 | 1.1263 | 1.0000 | 0.2382 | -0.1297 | 1.0000 | 0.0000
+Public diagnostic | proposed | 0.1052 | 1.2036 | 1.2036 | 1.0803 | 0.2689 | -0.1293 | 1.0026 | 0.0626
+Public diagnostic | improved | 0.1648 | 1.1907 | 1.1907 | 1.0266 | 0.2547 | -0.1087 | 0.9965 | 0.1303
+
+Table 14. Revised nested outer and historically consulted public results, including the passive index.
+
+Same allocation rule on the public block | Proposed predictions | Improved (ensemble) predictions
+naive | 1.122 (k = 50) | 1.243 (k = 801)
+binary | 1.803 (threshold 0) | 1.578 (threshold 0.00012)
+vol_target | 1.188 (k = 50) | 1.239 (k = 1067)
+Buy-and-hold (w=1) | 1.1263 | 1.1263
+
+Table 15. HISTORICAL exploratory public allocation comparison, with the passive reference added. These rows do not select the revised headline rule.
+
+Did each change help?
+
+Ensembling and sizing are assessed jointly as a selection procedure on later outer blocks. Model families, blend and sizing are selected on earlier inner folds; this avoids treating the best inner configuration as an unbiased evaluation.
+
+Revised outer modified Sharpe is 0.4933 ± 0.4502 for improved, 0.4480 ± 0.4347 for proposed and 0.4159 ± 0.4511 for passive. The historical 0.453 → 0.770 increase is not retained as confirmation of improvement.
+
+Public diagnostic: improved 1.1907, proposed 1.2036, passive 1.1263. The public recipe was fixed using the preceding training data; this does not undo earlier development exposure. Volatility and turnover are reported rather than assumed acceptable.
+
+4.4 Blend warm-up and historical development bug
+
+The inverse-volatility blend requires history. The revised pipeline predicts the 60 chronologically preceding feature rows using the same fitted models, prepends these predictions for rolling weights, then scores only the evaluation rows. The models and imputation medians are fitted solely on the permitted earlier training rows. Warm-up rows do not enter validation objectives or scores; their labels are used only if already part of the permitted training set. Each inner/outer fold has its own history, including the feature rows in its purge/validation-head gap. Public inference follows the same warm-up procedure.
+
+Historical context: an earlier version filled the undefined first 19 blend values with zero and reported 2.523 publicly; a later fix reported 1.239 with its historical models. Those numbers describe the earlier pipeline, not the revised nested experiment. The current code tests warm-up explicitly and does not assume that disjoint OOF folds are contiguous.
+
+
+
+Figure 3. HISTORICAL illustration of the blend warm-up bug from the original report. It is retained as development history, not as a plot of the revised nested experiment.
+
+4.5 Development history and unsuccessful attempts
+
+The final pipeline is the result of several iterations; we list the ones that changed conclusions.
+
+First ensemble was worse than the proposed model. An early improved notebook (improved_ensemble) scored 0.011 on the public block, far below the proposed model. Contributing causes: model tuning against modified Sharpe under the binary rule (a coarse, noisy objective that overfits 4 folds) and a fixed allocation. This led to change 4 (IC for models, modified Sharpe for sizing).
+
+Metric re-implementation. Our first modified_sharpe subtracted penalties instead of dividing by them and used arithmetic means; with that version the proposed model appeared to lose to B2. The function was rewritten to follow the official formula, and all notebooks were re-run.
+
+Reproducibility of LightGBM. Re-running identical code gave different tuned parameters and different public scores, until deterministic=True, force_row_wise=True were added.
+
+Allocation of the proposed model. During development the proposed model was also run with the binary rule, which scores higher on the public block (Table 15). The naive rule was kept in the final proposed model so that the allocation policy is fixed a priori and selected only in the improvement stage on CV data, not on the public block.
+
+Separate attempt to improve the pipeline (a team member's branch: stabilised Ridge scaling and ensemble calibration). It did not improve the metrics and was not merged.
+
+Blend warm-up bug (§4.4), found by an independent review of the improved notebook.
+
+5. Results
+
+5.1 Comparison of all models
+
+Model | Stage | Nested CV mod. Sharpe | Nested CV IC | Public mod. Sharpe | Public IC | Public Sharpe | Public vol ratio
+B1 ElasticNet | baseline | — | — | 0.3876 | -0.1359 | 1.3857 | 0.1049
+B2 LightGBM (61st) | baseline | — | — | 0.6172 | 0.0717 | 0.9215 | 0.7564
+B3 Frozen ensemble (100th) | baseline | — | — | 0.0848 | 0.0001 | 0.2998 | 0.5089
+passive | reference | 0.4159 ± 0.4511 | 0.0000 ± 0.0000 | 1.1263 | 0.0000 | 1.1263 | 1.0000
+proposed | proposed | 0.4480 ± 0.4347 | 0.0326 ± 0.0224 | 1.2036 | 0.1052 | 1.2036 | 1.0803
+improved | improved | 0.4933 ± 0.4502 | 0.0429 ± 0.0202 | 1.1907 | 0.1648 | 1.1907 | 1.0266
+
+Table 16. Revised results. Baseline public rows use their recorded procedures; notes in leaderboard.csv distinguish artifact replay from new training. Their outer CV cells are intentionally empty. Proposed, improved and passive CV rows use nested evaluation.
+
+
+
+Figure 4a. Revised nested outer modified Sharpe, including passive w=1.
+
+
+
+Figure 4b. Historically consulted public diagnostic, including the passive index and available baselines.
+
+
+
+Figure 5. Recomputed public wealth curves for proposed, improved and passive w=1, using the aligned predictions and allocations in results/analysis/predictions.csv.
+
+5.2 Analysis
+
+Baselines versus proposed. The original baseline scores reproduce when their archived artifacts are replayed. They are public-only reference points with different preprocessing, not a controlled comparison on the nested outer folds. Across 20 paired fit seeds (0–19), the mean domain-block IC gain is -0.00167 (sample SD 0.01002), positive in 10 runs; paired t=-0.747, p=0.4642. Parameters are fixed within each outer fold. This measures fit-seed sensitivity, not 20 independent datasets or repeated searches. The original single-seed +0.013 does not establish a stable contribution.
+
+Proposed vs. buy-and-hold. The proposed model is only marginally better than doing nothing (+0.04 on CV, −0.004 on the public block). A statistically weak but real ranking signal is not enough when the allocation rule is fixed.
+
+Improved versus proposed. The selection procedure is now evaluated on later outer blocks. A gain is only descriptive unless the paired interval and temporal limitations support a stronger conclusion. The historical 70% tuning-fold increase is not independent evidence.
+
+Failures and regime dependence are visible in the per-fold tables and wealth curves. A selected policy can lose to the passive reference on later blocks; the analysis retains those outcomes rather than switching the rule after looking at them.
+
+5.3 Prediction quality
+
+R² is close to zero for every model (CV mean 0.004–0.005, public −0.05 to 0.04) and the hit rate is 0.50–0.53. This is expected for daily excess returns and is the reason the models are tuned on rank correlation. The public-block IC (≈0.18) is more than twice the CV IC (≈0.075); with 180 observations the standard error of a correlation is about 0.075, so this difference is within noise and should not be read as better performance in recent years.
+
+5.4 Statistical reliability
+
+Paired moving-block bootstrap: 20-day non-circular blocks, 2000 resamples, seed 42, sampled within each fold; all strategies, market returns and risk-free returns use the same resampled rows. Results: cv: proposed − passive = +0.0321, 95% CI [-0.0157, +0.0864]; cv: improved − passive = +0.0774, 95% CI [-0.1757, +0.2706]; cv: improved − proposed = +0.0453, 95% CI [-0.1934, +0.2146]; public: proposed − passive = +0.0773, 95% CI [-0.0290, +0.3501]; public: improved − passive = +0.0645, 95% CI [-2.2721, +0.8594]; public: improved − proposed = -0.0128, 95% CI [-2.3388, +0.7039]. Intervals are conditional on fitted strategies and do not include retraining/selection uncertainty. Fit seeds share the same time series, so their paired t-test is a sensitivity diagnostic, not proof of market generalisation.
+
+6. Reproducibility
+
+6.1 Environment
+
+The revised verification used Python 3.14.10. Direct dependencies are pinned in requirements.txt; installed model-library versions are recorded in manifest.json. The earlier report was developed on Python 3.12/3.13.
+
+CPU only; no GPU and no pretrained weights are needed.
+
+Model-search seed=42; ablation fit seeds 0–19; CPU threads=2. Package versions: {"catboost": "1.2.10", "lightgbm": "4.7.0", "numpy": "2.4.4", "optuna": "5.0.0", "pandas": "3.0.2", "scikit-learn": "1.8.0", "scipy": "1.17.1"}.
+
+6.2 Data access
+
+Accept the competition rules on Kaggle and download the data into data/raw/ (only train.csv is required). Alternatively set the environment variable HULL_DATA_DIR to the folder with train.csv.
+
+kaggle competitions download -c hull-tactical-market-prediction -p data/raw
+
+unzip -o data/raw/hull-tactical-market-prediction.zip -d data/raw
+
+6.3 Step-by-step instructions
+
+python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\activate
+
+pip install -r requirements.txt
+
+jupyter nbconvert --to notebook --execute --inplace baselines/01_simple_baselines.ipynb
+
+jupyter nbconvert --to notebook --execute --inplace baselines/02_strong_baseline_61st.ipynb
+
+jupyter nbconvert --to notebook --execute --inplace baselines/03_strong_baseline_100th.ipynb
+
+jupyter nbconvert --to notebook --execute --inplace proposed_model/proposed_hybrid_model.ipynb
+
+jupyter nbconvert --to notebook --execute --inplace model_improvements/model_improvement.ipynb
+
+python data_checks.py && python report_analysis.py  # nested evaluation, ablation, paired bootstrap and figures
+
+
+
+Step | Output | Runtime scope
+Baseline artifact replay | leaderboard and aligned allocations | Verified with supplied B2/B3 artifacts
+Baseline fresh training | model/features or cached parameters | Separate seeded search; full retraining time not measured
+python report_analysis.py | Nested evaluation, 20-seed ablation, manifest, bootstrap and figures | Explicit budgets in manifest
+Both model notebooks | Views of the same shared analysis artifacts | Reuse existing analysis; generate if absent
+python -m unittest discover -s tests -v | Behavioral regression checks | CPU
+
+Table 17. Current execution paths and outputs. Full retraining runtimes depend on hardware; old laptop timing estimates are not claimed for the revised experiments.
+
+Run report_analysis.py before the two model notebooks; they load its shared artifacts. Use --quick for isolated results/smoke output and --reuse to regenerate statistics from stored predictions. B2 loads both model and feature list before plotting; absent checkpoints trigger training. Incomplete checkpoints are preserved with a clear error. To force a fresh baseline run, choose a new HULL_RESULTS_DIR instead of deleting existing artifacts. Python unittest discovers the regression suite.
+
+Reproducibility limits: original B2/B3 searches were not fully seeded, so archived-artifact replay and new seeded retraining are distinct. B3's online branch is inactive. New searches have fixed trial counts and explicit seeds; cross-platform bitwise identity is not claimed. data_checks.py reproduces internal distributional/chronological checks; it does not claim to recreate external index-return matches without a bundled reference series.
+
+7. Conclusion
+
+7.1 Summary of findings
+
+Three public ML solutions were reproduced on one leak-safe split. On our data none of them beats buy-and-hold; the best (61st place LightGBM) reaches modified Sharpe 0.617 on the held-out block.
+
+Domain features are used by the model, but their original single-seed +0.013 IC is insufficient evidence of a robust benefit. Across 20 paired fit seeds (0–19), the mean domain-block IC gain is -0.00167 (sample SD 0.01002), positive in 10 runs; paired t=-0.747, p=0.4642. Parameters are fixed within each outer fold. This measures fit-seed sensitivity, not 20 independent datasets or repeated searches. The original single-seed +0.013 does not establish a stable contribution.
+
+The revised improved pipeline scores 0.4933 ± 0.4502 on outer CV versus 0.4159 ± 0.4511 for passive and 0.4480 ± 0.4347 for proposed. This replaces selection-fold improvement claims; the public results remain retrospective.
+
+A silent warm-up bug had inflated an earlier public score from 1.24 to 2.52; it was found, fixed and kept as a regression check.
+
+7.2 Limitations
+
+Small diagnostic period. The public block has only 180 contiguous observations from one market regime and was consulted during development. Bootstrap precision cannot restore test independence.
+
+Historical versus revised CV. The old model/blend/policy selection reused reported folds. The revised code nests all selection within outer training periods, with train-only imputation and no outer early stopping. Retrospective validation on a previously studied dataset still cannot establish prospective performance.
+
+Selection and seed sensitivity. There are only four outer periods and a deliberately finite search budget. The 20 paired seeds hold hyperparameters fixed per fold and do not cover the variability of rerunning the entire search. Allocation choice may vary across periods.
+
+Baselines are evaluated on the public block only and keep their original validation schemes (sklearn TimeSeriesSplit without purge).
+
+Volatility and costs. Check the measured volatility ratios against 1.2 in the revised tables. The metric penalises excess volatility but does not enforce a hard constraint; transaction costs are not modelled and high turnover can reduce realised performance.
+
+Metric. modified_sharpe is our re-implementation of the official formula; it was checked against the public description and code, but the organisers' evaluation service could not be used, and the forecasting-phase test data are unavailable.
+
+No analysis of distribution shift between the training period and the public block was performed.
+
+7.3 Future work
+
+Prospective evaluation on newly arriving market data, plus more nested walk-forward windows and repeated full-search seeds. Nested temporal selection is already implemented in this revision.
+
+Constrained sizing (calibrating the scale to a target volatility ratio ≤ 1.2 instead of tuning it on the score) and turnover smoothing.
+
+Combining the model forecast with the no-learning reversion signal and shrinking the tilt towards w = 1.
+
+Attribution and use of AI tools
+
+Borrowed code and ideas. Baseline notebooks B1–B3 are adaptations of the public notebooks listed below; their modelling code belongs to the original authors, and our changes are marked ADDED (PMLDL Stage 1). The domain feature family, inverse-volatility blending and volatility targeting in src/ are re-implementations of ideas described in the 4th-place write-up (no code was available). The lag/rolling feature design, the LightGBM + Optuna-on-Spearman setup and the binary allocation rule come from the 61st-place notebook. The cross terms U1/U2 come from the Hull starter notebook. The metric follows the organisers' published scoring code. Libraries: scikit-learn, LightGBM, CatBoost, XGBoost, Optuna, pandas, NumPy, SciPy, polars, matplotlib.
+
+AI assistants. Parts of the shared library src/, the proposed and improved notebooks, the analysis script and drafts of this report were written with the help of an AI coding assistant (Claude). All generated code was run, checked and edited by the team; the numbers in this report are taken from the executed notebooks and results/leaderboard.csv.
+
+References
+
+Hull Tactical Market Prediction, Kaggle competition: https://www.kaggle.com/competitions/hull-tactical-market-prediction
+
+Official metric code: https://www.kaggle.com/code/metric/hull-competition-sharpe
+
+B1 — Hull leak-safe baseline: https://www.kaggle.com/code/morodertobias/hull-leak-safe-baseline
+
+Hull starter notebook: https://www.kaggle.com/code/laurentlanteigne/hull-starter-notebook
+
+B2 — 61st place write-up: https://www.kaggle.com/competitions/hull-tactical-market-prediction/writeups/single-model-simple-decision-61st-place-silver ; code: https://www.kaggle.com/code/rafanikitas/hull-eda-training-pipeline
+
+B3 — 100th place write-up: https://www.kaggle.com/competitions/hull-tactical-market-prediction/writeups/100th-place-ensemble-prediction-naive-allocation ; code: https://www.kaggle.com/code/tingkaigong/hull-market-prediction-just-improved
+
+4th place write-up "Technical model, no learning, short-term mean reversion" (competition write-ups page); copy in baselines/04_4th_writeup.md

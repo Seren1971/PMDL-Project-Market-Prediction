@@ -8,3 +8,4 @@ catboost_info
 .nocommit
 *.joblib
 *.cbm
+.venv/

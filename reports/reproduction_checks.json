@@ -1,0 +1,63 @@
+{
+  "unit_tests": {
+    "command": "python -m unittest discover -s tests -v",
+    "passed": 9
+  },
+  "notebooks": {
+    "baseline_clean_kernel_archive_replay": [
+      "01_simple_baselines.ipynb",
+      "02_strong_baseline_61st.ipynb",
+      "03_strong_baseline_100th.ipynb"
+    ],
+    "fresh_training_smoke": [
+      "02_strong_baseline_61st.ipynb",
+      "03_strong_baseline_100th.ipynb"
+    ],
+    "model_clean_kernel": [
+      "proposed_hybrid_model.ipynb",
+      "model_improvement.ipynb"
+    ],
+    "b3_online_retuning_calls": 0,
+    "b3_training_frame_changed": false
+  },
+  "full_analysis": {
+    "outer_folds": 4,
+    "inner_folds": 3,
+    "paired_fit_seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19
+    ],
+    "bootstrap_draws": 2000,
+    "block_size": 20,
+    "seed": 42
+  },
+  "report": {
+    "zip_integrity": true,
+    "xml_parts_parse": true,
+    "rebuild_text_identical": true,
+    "layout_rendered_in_office": false
+  },
+  "not_run": [
+    "Full 200-trial B2 retraining; checkpoint replay and 80-tree cold smoke verified instead",
+    "Full new B3 search; cached-parameter replay and one-trial-per-family cold smoke verified instead"
+  ],
+  "dataset_matches_supplied_archive": true
+}

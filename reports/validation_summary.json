@@ -1,0 +1,245 @@
+{
+  "source_sha256": "d2785cc22a6a1589168fe351e4b050efcc0f71aa00a2dc485597dff2df22fcdf",
+  "data_sha256": "8c1aba83e1bf34f91b234b7979f1fc7c397186b33a8d08bdd3634c08eb3810ca",
+  "config": {
+    "seed": 42,
+    "seed_count": 20,
+    "model_trials": 8,
+    "allocation_trials": 16,
+    "inner_splits": 3,
+    "max_estimators": 300,
+    "n_jobs": 2
+  },
+  "data_checks": {
+    "data_sha256": "8c1aba83e1bf34f91b234b7979f1fc7c397186b33a8d08bdd3634c08eb3810ca",
+    "raw_rows": 9048,
+    "usable_rows": 8042,
+    "train_rows": 7862,
+    "public_rows": 180,
+    "raw_features": 94,
+    "engineered_features": 335,
+    "train_date_ids": [
+      1006,
+      8867
+    ],
+    "public_date_ids": [
+      8868,
+      9047
+    ],
+    "complete_features": 72,
+    "target_mean": 6.981468724322304e-05,
+    "target_std": 0.01083905921245068,
+    "return_excess_kurtosis": 2.080956053734673,
+    "jarque_bera_statistic": 1497.7417739856082,
+    "jarque_bera_pvalue": 0.0,
+    "return_lag1_autocorrelation": -0.05111116045581849,
+    "squared_return_lag1_autocorrelation": 0.26481391296278284,
+    "limits": "Distributional checks alone cannot establish data provenance or map anonymous dates. No external index reference series is bundled; historical external-return matches are not claimed as independently reproduced.",
+    "checks_passed": [
+      "unique dates",
+      "chronological split",
+      "180 public rows",
+      "no look-ahead features",
+      "causal return lag",
+      "purged folds"
+    ]
+  },
+  "ablation": {
+    "n_seeds": 20,
+    "mean_gain": -0.00167441340111988,
+    "std_gain": 0.010023798433190716,
+    "positive_seeds": 10,
+    "paired_t": -0.7470425931437797,
+    "paired_pvalue": 0.4641830229868924,
+    "scope": "Fit-seed sensitivity with parameters fixed within each outer fold; seeds share data and do not measure temporal uncertainty."
+  },
+  "bootstrap": [
+    {
+      "split": "cv",
+      "model": "proposed",
+      "reference": "passive",
+      "observed_delta": 0.0320897054918663,
+      "ci_low": -0.0157227597483573,
+      "ci_high": 0.0863888475009328,
+      "fraction_positive": 0.9235,
+      "draws": 2000,
+      "block_size": 20,
+      "seed": 42
+    },
+    {
+      "split": "cv",
+      "model": "improved",
+      "reference": "passive",
+      "observed_delta": 0.0773658405697332,
+      "ci_low": -0.1756729306499362,
+      "ci_high": 0.2705680971621391,
+      "fraction_positive": 0.738,
+      "draws": 2000,
+      "block_size": 20,
+      "seed": 42
+    },
+    {
+      "split": "cv",
+      "model": "improved",
+      "reference": "proposed",
+      "observed_delta": 0.0452761350778669,
+      "ci_low": -0.1933767256330274,
+      "ci_high": 0.2146181234710974,
+      "fraction_positive": 0.6295,
+      "draws": 2000,
+      "block_size": 20,
+      "seed": 42
+    },
+    {
+      "split": "public",
+      "model": "proposed",
+      "reference": "passive",
+      "observed_delta": 0.0773064924512727,
+      "ci_low": -0.0289597881652708,
+      "ci_high": 0.3500916070897725,
+      "fraction_positive": 0.944,
+      "draws": 2000,
+      "block_size": 20,
+      "seed": 42
+    },
+    {
+      "split": "public",
+      "model": "improved",
+      "reference": "passive",
+      "observed_delta": 0.0644752915524953,
+      "ci_low": -2.272081463286948,
+      "ci_high": 0.8593796092277229,
+      "fraction_positive": 0.485,
+      "draws": 2000,
+      "block_size": 20,
+      "seed": 42
+    },
+    {
+      "split": "public",
+      "model": "improved",
+      "reference": "proposed",
+      "observed_delta": -0.0128312008987774,
+      "ci_low": -2.3388002076767096,
+      "ci_high": 0.7038750725487748,
+      "fraction_positive": 0.378,
+      "draws": 2000,
+      "block_size": 20,
+      "seed": 42
+    }
+  ],
+  "versions": {
+    "numpy": "2.4.4",
+    "pandas": "3.0.2",
+    "scipy": "1.17.1",
+    "lightgbm": "4.7.0",
+    "catboost": "1.2.10",
+    "scikit-learn": "1.8.0",
+    "optuna": "5.0.0"
+  },
+  "python": "3.14.10",
+  "report_source": "PMLDL_Stage2_Report.docx",
+  "baseline_public_metrics": {
+    "elasticnet_leak_safe": {
+      "modified_sharpe": 0.3875713376714612,
+      "spearman_ic": -0.1359177752399765,
+      "vol_ratio": 0.1048995839709348
+    },
+    "lgbm_61st": {
+      "modified_sharpe": 0.6171615848858826,
+      "spearman_ic": 0.0716738199887508,
+      "vol_ratio": 0.7563880540978581
+    },
+    "online_ensemble_100th": {
+      "modified_sharpe": 0.0847612837036404,
+      "spearman_ic": 0.0001028838338631,
+      "vol_ratio": 0.5089421634169111
+    }
+  },
+  "outer_fold_metrics": [
+    {
+      "model": "improved",
+      "fold": 0,
+      "modified_sharpe": -0.2630232880227961,
+      "spearman_ic": 0.0520553178861629,
+      "vol_ratio": 0.9864233840921413
+    },
+    {
+      "model": "improved",
+      "fold": 1,
+      "modified_sharpe": 0.5694310947642998,
+      "spearman_ic": 0.0371348596892785,
+      "vol_ratio": 0.6819245237401111
+    },
+    {
+      "model": "improved",
+      "fold": 2,
+      "modified_sharpe": 0.8047014811756793,
+      "spearman_ic": 0.0137067520758519,
+      "vol_ratio": 1.2514220351072314
+    },
+    {
+      "model": "improved",
+      "fold": 3,
+      "modified_sharpe": 0.861899004312735,
+      "spearman_ic": 0.0687371723524134,
+      "vol_ratio": 0.8562321316693376
+    },
+    {
+      "model": "passive",
+      "fold": 0,
+      "modified_sharpe": -0.2412767778128747,
+      "spearman_ic": 0.0,
+      "vol_ratio": 1.0
+    },
+    {
+      "model": "passive",
+      "fold": 1,
+      "modified_sharpe": 0.2517678551978348,
+      "spearman_ic": 0.0,
+      "vol_ratio": 1.0
+    },
+    {
+      "model": "passive",
+      "fold": 2,
+      "modified_sharpe": 0.921469807985718,
+      "spearman_ic": 0.0,
+      "vol_ratio": 1.0
+    },
+    {
+      "model": "passive",
+      "fold": 3,
+      "modified_sharpe": 0.7315840445803069,
+      "spearman_ic": 0.0,
+      "vol_ratio": 1.0
+    },
+    {
+      "model": "proposed",
+      "fold": 0,
+      "modified_sharpe": -0.1607098563329842,
+      "spearman_ic": 0.0537393192030018,
+      "vol_ratio": 1.0646573637424637
+    },
+    {
+      "model": "proposed",
+      "fold": 1,
+      "modified_sharpe": 0.241454020071817,
+      "spearman_ic": 0.0239858531299843,
+      "vol_ratio": 1.1169943255056844
+    },
+    {
+      "model": "proposed",
+      "fold": 2,
+      "modified_sharpe": 0.9271925948055272,
+      "spearman_ic": -0.0001090552476979,
+      "vol_ratio": 1.0188603139029588
+    },
+    {
+      "model": "proposed",
+      "fold": 3,
+      "modified_sharpe": 0.7839669933740904,
+      "spearman_ic": 0.0529190980022582,
+      "vol_ratio": 1.092452834954358
+    }
+  ],
+  "historical_pdf": "Latest PDF metadata: project.zip/project.pdf, 2026-09-16 22:04:22 Europe/Moscow"
+}

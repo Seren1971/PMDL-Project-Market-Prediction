@@ -168,7 +168,10 @@ def build_features(
 
 
 def top_features_by_gain(model, feature_names: list[str], k: int = 50) -> list[str]:
-    """Top-k features by a fitted tree model's importance."""
-    importance = np.asarray(model.feature_importances_, dtype=float)
+    """Top-k features by LightGBM gain, or the estimator's native importance."""
+    if hasattr(model, "booster_"):
+        importance = model.booster_.feature_importance(importance_type="gain")
+    else:
+        importance = np.asarray(model.feature_importances_, dtype=float)
     order = np.argsort(importance)[::-1][:k]
     return [feature_names[i] for i in order]

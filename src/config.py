@@ -66,7 +66,7 @@ FEATURE_PREFIXES = ("M", "E", "I", "P", "V", "S", "D")
 PUBLIC_TEST_SIZE = 180
 
 # --------------------------------------------------------------------------
-# Shared cross-validation settings - IDENTICAL IN EVERY NOTEBOOK
+# Shared outer cross-validation settings for proposed and improved pipelines
 # --------------------------------------------------------------------------
 CV_N_SPLITS = 4
 CV_EMBARGO = 20  # trading days dropped after each validation block
